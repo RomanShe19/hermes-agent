@@ -1260,3 +1260,33 @@ def test_failed_group_preserves_child_results_in_delivery_and_history(monkeypatc
         assert (failed["task_index"], failed["goal"], failed["status"]) == (3, "resume inspection", "unknown")
     finally:
         release.set()
+
+
+def test_first_drain_does_not_duplicate_a_live_delegation_completion(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(process_registry, "_completions_restored", False)
+    saved, publish = threading.Event(), threading.Event()
+    persist = ad._persist_completion
+
+    def persist_then_pause(event, result):
+        persist(event, result)
+        saved.set()
+        assert publish.wait(8)
+
+    monkeypatch.setattr(ad, "_persist_completion", persist_then_pause)
+    handle = ad.dispatch_async_delegation(
+        goal="finish once", context=None, toolsets=None, role="leaf", model=None,
+        session_key="owner", runner=lambda: {"status": "completed", "summary": "finished result"},
+    )
+    try:
+        assert saved.wait(8)
+        assert ad.restore_undelivered_completions(process_registry.completion_queue) == 0
+    finally:
+        publish.set()
+    event = _drain_for(handle["delegation_id"])
+    assert event and event["status"] == "completed"
+    process_registry.completion_queue.put(event)
+
+    drained = process_registry.drain_notifications(session_key="owner")
+    assert [payload["delegation_id"] for payload, _ in drained] == [handle["delegation_id"]]
+    assert not drained[0][0].get("restored")

@@ -165,6 +165,7 @@ def test_restart_replay_and_sweep_never_offer_the_same_row_twice(tmp_path):
     q = queue.Queue()
     with _Home(home):
         assert ad.restore_undelivered_completions(q) == 1
+        assert ad.restore_undelivered_completions(q) == 0
         assert ad.sweep_orphaned_completions(q, now=later) == 0
     assert [e["delegation_id"] for e in _drain(q)] == [delegation_id]
 

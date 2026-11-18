@@ -348,6 +348,10 @@ def _replay_pending(conn, rows, target_queue, now: float) -> int:
     the orphan sweep skips the row until the copy is handed back (``return_completion_offer``)."""
     home, restored = hermes_home_key(get_hermes_home()), 0
     for delegation_id, payload, completed_at, dispatched_at in rows:
+        offer_key = (home, delegation_id)
+        with _orphan_lock:
+            if offer_key in _offered:
+                continue
         age_basis = completed_at or dispatched_at
         if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
             conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
@@ -361,9 +365,11 @@ def _replay_pending(conn, rows, target_queue, now: float) -> int:
         evt = json.loads(payload)
         if isinstance(evt, dict):
             evt["restored"] = True
-        target_queue.put(evt)
         with _orphan_lock:
-            _offered.add((home, delegation_id))
+            if offer_key in _offered:
+                continue
+            target_queue.put(evt)
+            _offered.add(offer_key)
         restored += 1
     return restored
 
@@ -431,10 +437,15 @@ def maybe_sweep_orphaned_completions(target_queue, *, now: Optional[float] = Non
         return 0
 
 
-def _update_delivery(sql: str, params: tuple) -> bool:
+def _update_delivery(sql: str, params: tuple, *, settled_id: str | None = None) -> bool:
     """Run one UPDATE on the ledger; True iff exactly one row changed."""
-    with _DB_LOCK, _transaction() as conn:
-        return conn.execute(sql, params).rowcount == 1
+    with _DB_LOCK:
+        with _transaction() as conn:
+            changed = conn.execute(sql, params).rowcount == 1
+        if changed and settled_id:
+            with _orphan_lock:
+                _offered.discard((hermes_home_key(get_hermes_home()), settled_id))
+        return changed
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
@@ -442,7 +453,8 @@ def mark_completion_delivered(delegation_id: str) -> bool:
     now = time.time()
     return _update_delivery(
         """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
-           WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
+           WHERE delegation_id=? AND delivery_state!='delivered'""",
+        (now, now, delegation_id), settled_id=delegation_id)
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -520,7 +532,7 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                   updated_at=?, delivery_claim=NULL,
                   delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
-             AND delivery_claim=?""", (time.time(), delegation_id, claim_id))
+             AND delivery_claim=?""", (time.time(), delegation_id, claim_id), settled_id=delegation_id)
 
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -530,7 +542,7 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                   delivered_at=?, updated_at=?, delivery_claim=NULL,
                   delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
-             AND delivery_claim=?""", (now, now, delegation_id, claim_id))
+             AND delivery_claim=?""", (now, now, delegation_id, claim_id), settled_id=delegation_id)
 
 
 def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
@@ -982,14 +994,22 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
+    # Reserve the local offer before the row becomes eligible for replay.
+    offer_key = (hermes_home_key(get_hermes_home()), evt["delegation_id"])
+    with _orphan_lock:
+        _offered.add(offer_key)
     try:
         _persist_completion(evt, result)
     except Exception as exc:
+        with _orphan_lock:
+            _offered.discard(offer_key)
         logger.error(f"Async delegation{label} %s: durable completion write failed; delivering in-memory "
                      "only (a restart may report this unit as unknown): %s", record.get("delegation_id"), exc)
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
+        with _orphan_lock:
+            _offered.discard(offer_key)
         logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
                      "result lost: %s", record.get("delegation_id"), exc)
 
