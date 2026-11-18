@@ -235,7 +235,7 @@ def delegation_outcome(statuses: Iterable[Any]) -> str:
     succeeded = sum(s in _SUCCESS_STATUSES for s in values)
     if values and succeeded == len(values):
         return "success"
-    if succeeded:
+    if succeeded or "partial" in values:
         return "partial"
     return "cancelled" if any(s in _CANCELLED_STATUSES for s in values) else "failed"
 
@@ -264,7 +264,19 @@ def begin_delegation_run(call_key: object, *, subagents: int, depth: int) -> Non
 
 def finish_delegation_unit(call_key: object, results: Iterable[Any], *, background: bool) -> None:
     """Fold one joined unit into its call; the call's single row is emitted by its last unit."""
-    statuses = [r.get("status") if isinstance(r, dict) else None for r in results]
+    from tools.process_registry_notifications import is_delegation_truncated
+
+    statuses: list[Any] = []
+    for result in results:
+        if not isinstance(result, dict):
+            statuses.append(None)
+            continue
+        status = result.get("status")
+        if _norm(status) in _SUCCESS_STATUSES and (
+            is_delegation_truncated(result) or result.get("schema_valid") is False
+        ):
+            status = "partial"
+        statuses.append(status)
     with _DELEGATIONS_LOCK:
         run = _DELEGATIONS.get(id(call_key))
         if run is None:

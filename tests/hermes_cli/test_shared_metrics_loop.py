@@ -322,3 +322,21 @@ def test_browser_tool_backend_is_resolved_from_the_profile_at_call_time(home, mo
 
 def _raise():
     raise RuntimeError("boom")
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"status": "completed", "exit_reason": "max_iterations"},
+        {"status": "completed", "truncated": True},
+        {"status": "completed", "schema_valid": False},
+    ],
+)
+def test_unverified_child_output_counts_as_partial_delegation(home, result):
+    call = object()
+    loop.begin_delegation_run(call, subagents=1, depth=1)
+    loop.finish_delegation_unit(call, [result], background=False)
+
+    assert _rows(home, "hermes.delegation.run.count") == [(
+        {"depth": "1", "mode": "foreground", "outcome": "partial", "subagent_count_bucket": "1"}, 1,
+    )]
