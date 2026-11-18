@@ -101,7 +101,7 @@ def test_a_loop_wakeup_whose_send_cannot_start_hands_the_turn_back(monkeypatch):
     server._notif_slash_loop_tick("rid", "sid", session, mgr, "/skill go")
 
     assert session["running"] is False
-    assert ticks == ["completed"]
+    assert ticks == ["abandoned"]
 
 
 def test_the_poller_thread_survives_a_dispatch_that_raises(monkeypatch):

@@ -131,6 +131,7 @@ def test_tui_tick_fires_when_idle_and_due(server, session):
 
     def fake_submit(rid, sid_, session_, text, **kwargs):
         fired["text"] = text
+        return True
 
     with patch.object(server, "_run_prompt_submit", fake_submit), \
          patch.object(server, "_emit"):
@@ -217,3 +218,32 @@ def test_tui_tick_noop_when_not_due(server, session):
 
     submit.assert_not_called()
     assert s["running"] is False
+
+
+@pytest.mark.parametrize("prompt", ["poll the build", "/skill go"])
+@pytest.mark.parametrize("raises", [False, True])
+def test_tui_tick_rolls_back_unstarted_turn(server, session, monkeypatch, prompt, raises):
+    from hermes_cli.loops import LoopManager, save_loop
+
+    sid, session_key, state = session
+    mgr = LoopManager(session_key)
+    mgr.set(prompt, interval_seconds=60)
+    mgr.state.next_due_at = time.time() - 1
+    save_loop(session_key, mgr.state)
+    monkeypatch.setitem(server._methods, "command.dispatch",
+                        lambda *args: {"result": {"type": "send", "message": "run the skill"}})
+    frames = []
+    monkeypatch.setattr(server, "_emit", lambda event, *args: frames.append(event))
+
+    def refuse(rid, sid, session, text, **kwargs):
+        if raises:
+            raise RuntimeError("thread start failed")
+        session["running"] = False
+        return False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", refuse)
+    server._maybe_fire_tui_loop_tick(sid, state)
+    saved = LoopManager(session_key).state
+    assert not saved.awaiting_response and saved.ticks_fired == 0
+    assert state["running"] is False
+    assert "message.start" not in frames

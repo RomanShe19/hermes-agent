@@ -191,8 +191,12 @@ def _notif_slash_loop_tick(rid: str, sid: str, session: dict, mgr, wakeup: str) 
             if not _notif_claim_turn(session):
                 mgr.abandon_tick()
                 return
-            # Releases the claim on failure: the swallow below would otherwise leave the session busy for good.
-            _notif_submit(rid, sid, session, payload["message"], "loop wakeup send failed")
+            try:
+                started = _notif_submit(rid, sid, session, payload["message"], "loop wakeup send failed")
+            except Exception:
+                started = False
+            if not started:
+                mgr.abandon_tick()
             return
     except Exception:
         pass
@@ -311,9 +315,8 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         _notif_loop_status(sid, f"↻ /loop wakeup #{mgr.state.ticks_fired if mgr.state else '?'} firing…")
         if wakeup.lstrip().startswith("/"):
             _notif_slash_loop_tick(rid, sid, session, mgr, wakeup)
-        else:
-            _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, wakeup)
+        elif not _run_prompt_submit(rid, sid, session, wakeup):
+            mgr.abandon_tick()
     except Exception as exc:
         _notif_log_failure("loop wakeup dispatch failed", exc)
         _notif_release_turn(session)
