@@ -619,6 +619,16 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     return True
 
 
+def _notif_requeue_completions(events, registry, deferred) -> None:
+    if deferred is not None:
+        deferred.extend(events)
+        return
+    for event in events:
+        registry.completion_queue.put(event)
+    # A refused worker can leave this session idle and the queue nonempty.
+    time.sleep(0.25)
+
+
 def _notif_dispatch_completions(sid, session, notifications, registry, deferred):
     from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
@@ -626,10 +636,7 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
     if not notifications:
         return
     if not _notif_claim_turn(session):
-        for event, _text in notifications:
-            (deferred.append if deferred is not None else registry.completion_queue.put)(event)
-        if deferred is None:
-            time.sleep(0.25)
+        _notif_requeue_completions((event for event, _text in notifications), registry, deferred)
         return
     claimed: list = []
     try:
@@ -638,6 +645,7 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
                 claimed.append((event, event_text, claim))
         batch = ProcessNotificationBatch(tuple((event, event_text) for event, event_text, _claim in claimed))
         text = batch.render(registry)
+        display_text = batch.display_text(registry) if text is not None else None
     except Exception as exc:
         _notif_log_failure("completion batch preparation failed", exc)
         _notif_release_turn(session)
@@ -646,15 +654,19 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
         return
     if text is None:
         _notif_release_turn(session)
-    try:
-        if text is not None:
-            _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
-                          "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
-                          display_metadata={"display_text": batch.display_text(registry)})
-    except Exception:
-        for event, _text, claim in claimed:
-            release_event_delivery(event, claim)
-        return
+    else:
+        try:
+            started = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+                                    "completion batch dispatch failed",
+                                    display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
+                                    display_metadata={"display_text": display_text})
+        except Exception:
+            started = False
+        if not started:
+            for event, _text, claim in claimed:
+                release_event_delivery(event, claim)
+            _notif_requeue_completions((event for event, _text, _claim in claimed), registry, deferred)
+            return
     for event, _text, claim in claimed:
         complete_event_delivery(event, claim)
 

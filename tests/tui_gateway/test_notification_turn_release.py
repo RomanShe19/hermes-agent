@@ -30,7 +30,11 @@ def _claimed_session() -> dict:
 
 def _no_turn(monkeypatch) -> list:
     started: list = []
-    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: started.append(a))
+    def submit(*args, **kwargs):
+        started.append(args)
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
     return started
 
@@ -83,6 +87,60 @@ def test_a_completion_batch_that_cannot_be_prepared_hands_the_turn_back(monkeypa
     assert session["running"] is False and started == []
     # Claims already taken go back too, or those completions are lost to every consumer for 300 s.
     assert released == (["claim-a"] if fail_at == "claim" else ["claim-a", "claim-b"])
+
+
+@pytest.mark.parametrize("defer", [False, True], ids=["poller", "drain"])
+@pytest.mark.parametrize("failure", ["refused", "raised"])
+def test_unstarted_process_completion_batch_is_reoffered_once(monkeypatch, defer, failure):
+    from tools.process_registry import ProcessRegistry
+    from tools.process_registry_notifications import format_process_notification
+
+    registry = ProcessRegistry()
+    session = {"history_lock": threading.RLock(), "running": False, "history": []}
+    events = [
+        {"type": "completion", "session_id": "proc_ok", "exit_code": 0},
+        {"type": "completion", "session_id": "proc_failed", "exit_code": 1},
+    ]
+    prompts, frames, delays = [], [], []
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: frames.append(args))
+    monkeypatch.setattr(server, "_background_notifications_off", lambda session: False)
+    monkeypatch.setattr(server.time, "sleep", delays.append)
+
+    def submit(rid, sid, session, text, **kwargs):
+        prompts.append(text)
+        if len(prompts) == 1:
+            if failure == "raised":
+                raise RuntimeError("worker could not be started")
+            with session["history_lock"]:
+                session["running"] = False
+            return False
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    emitted = set()
+    deferred = [] if defer else None
+    server._notif_handle_ready("sid", session, events, emitted, registry,
+                               format_process_notification, deferred, owned=True)
+
+    assert session["running"] is False
+    if defer:
+        assert deferred == events and registry.completion_queue.empty()
+        retry = deferred[:]
+        deferred.clear()
+    else:
+        retry = [registry.completion_queue.get_nowait() for _ in events]
+    assert retry == events
+    assert delays == ([] if defer else [0.25])
+
+    server._notif_handle_ready("sid", session, retry, emitted, registry,
+                               format_process_notification, deferred, owned=True)
+
+    assert prompts[0] == prompts[1]
+    assert "proc_ok" in prompts[1] and "exit code 0" in prompts[1]
+    assert "proc_failed" in prompts[1] and "exit code 1" in prompts[1]
+    assert len(frames) == len(events)
+    assert registry.completion_queue.empty() and not deferred
+    assert session["running"] is True
 
 
 def test_a_loop_wakeup_whose_send_cannot_start_hands_the_turn_back(monkeypatch):
