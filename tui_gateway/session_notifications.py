@@ -160,6 +160,17 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
+def _notif_emit_process_status(sid: str, text: str, *, diagnostic: bool) -> None:
+    from gateway.warning_notifications import render_notification
+
+    try:
+        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
+                            platform="tui", diagnostic=diagnostic)
+    except Exception as exc:
+        # Presentation is best-effort; the owning session still needs the result.
+        logger.warning("Process status presentation failed (%s)", type(exc).__name__)
+
+
 def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> bool:
     """Return whether the prompt runner accepted the claimed turn; release on exception."""
     try:
@@ -459,12 +470,11 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
     except Exception as exc:
         _notif_log_failure("kanban notification poll failed", exc)
         texts = []
-    for text in texts:
-        from gateway.warning_notifications import DiagnosticText, render_notification
-        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
-                            platform="tui", diagnostic=isinstance(text, DiagnosticText))
     if texts:
+        from gateway.warning_notifications import DiagnosticText
         session.setdefault("_kanban_pending", []).extend(texts)
+        for text in texts:
+            _notif_emit_process_status(sid, text, diagnostic=isinstance(text, DiagnosticText))
     if not session.get("_kanban_pending") or not _notif_claim_turn(session):
         return
     with session["history_lock"]:
@@ -593,9 +603,7 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         display_text = (async_delegation_display_text(evt) if is_delegation
                         else process_completion_display_text([evt]) if evt_type == "completion" else text)
         from agent.notification_presentation import diagnostic_process_event
-        from gateway.warning_notifications import render_notification
-        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": display_text}),
-                            platform="tui", diagnostic=diagnostic_process_event(evt))
+        _notif_emit_process_status(sid, display_text, diagnostic=diagnostic_process_event(evt))
         emitted.add(dedup_key)
     if evt_type != "async_delegation" and _background_notifications_off(session):
         # The user opted out of process-driven agent wakes: the status row above is the whole

@@ -223,6 +223,29 @@ def test_malformed_event_does_not_drop_valid_completions_in_same_snapshot(monkey
     assert "proc_invalid" not in prompt
 
 
+def test_status_sink_failure_does_not_drop_a_valid_process_completion(monkeypatch):
+    from tools.process_registry import ProcessRegistry
+    from tools.process_registry_notifications import format_process_notification
+
+    registry = ProcessRegistry()
+    submitted = _no_turn(monkeypatch)
+    monkeypatch.setattr(server, "_background_notifications_off", lambda session: False)
+
+    def broken_status(event, sid, payload=None):
+        if event == "status.update":
+            raise BrokenPipeError("status sink is unavailable")
+
+    monkeypatch.setattr(server, "_emit", broken_status)
+    session = {"history_lock": threading.RLock(), "running": False, "history": []}
+    events = [{"type": "completion", "session_id": "proc_keep", "exit_code": 0}]
+
+    server._notif_handle_ready("sid", session, events, set(), registry,
+                               format_process_notification, None, owned=True)
+
+    assert len(submitted) == 1
+    assert "proc_keep" in submitted[0][3] and "exit code 0" in submitted[0][3]
+
+
 def test_refused_prompt_keeps_durable_delegation_pending_until_accepted(monkeypatch, tmp_path):
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tools import async_delegation as ledger

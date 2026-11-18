@@ -791,9 +791,11 @@ class Event:
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Event:
         run_id = _row_get(row, "run_id")
+        payload = _json_or(_lossy_text(row["payload"]))
         return cls(
             id=row["id"], task_id=row["task_id"], kind=_lossy_text(row["kind"]),
-            payload=_json_or(_lossy_text(row["payload"])), created_at=_to_epoch(row["created_at"]) or 0,
+            payload=payload if isinstance(payload, dict) else None,
+            created_at=_to_epoch(row["created_at"]) or 0,
             run_id=_opt_int(run_id),
         )
 
