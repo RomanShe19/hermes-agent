@@ -1142,23 +1142,6 @@ def _run_prompt_submit(
         muted = diagnostic_turn_muted(display_metadata, "tui", notification_config)
     if muted:
         display_kind = "hidden"
-    # The ONE INFO record proving a prompt was accepted by THIS process; ties ui sid,
-    # session_key and the agent's live session_id together.  No prompt content is logged.
-    _turn_started_monotonic = time.monotonic()
-    logger.info(
-        # Desktop/TUI observability (#86647): this is the ONE INFO record proving a Desktop/TUI prompt was
-        # accepted by THIS process, and it ties together every id a rotation-mute trace needs — the UI
-        # session id, the gateway session_key, and the agent's live session_id (which compression rotates
-        # independently of the other two). Before this line a Desktop request left no trace in agent.log at
-        # all ("0 platform=desktop" — see #86647), so a muted window was structurally indistinguishable from
-        # a request that never arrived.
-        "tui prompt accepted: ui_session=%s session_key=%s agent_session_id=%s "
-        "kind=%s chars=%s images=%d",
-        sid, session.get("session_key") or "", getattr(agent, "session_id", "") or "",
-        display_kind or "user", len(text) if isinstance(text, str) else "-", len(images))
-    if not muted:
-        _emit("message.start", sid)
-
     def run_body():
         # RPC-dispatcher ContextVars do not follow onto this thread: rebind the transport
         # before any tool can commission a child (delegate_task captures it as authority).
@@ -1170,7 +1153,22 @@ def _run_prompt_submit(
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
+        _turn_started_monotonic = time.monotonic()
         try:
+            # Only the running thread establishes acceptance; no prompt content is logged.
+            logger.info(
+                # Desktop/TUI observability (#86647): this is the ONE INFO record proving a Desktop/TUI prompt was
+                # accepted by THIS process, and it ties together every id a rotation-mute trace needs — the UI
+                # session id, the gateway session_key, and the agent's live session_id (which compression rotates
+                # independently of the other two). Before this line a Desktop request left no trace in agent.log at
+                # all ("0 platform=desktop" — see #86647), so a muted window was structurally indistinguishable from
+                # a request that never arrived.
+                "tui prompt accepted: ui_session=%s session_key=%s agent_session_id=%s "
+                "kind=%s chars=%s images=%d",
+                sid, session.get("session_key") or "", getattr(agent, "session_id", "") or "",
+                display_kind or "user", len(text) if isinstance(text, str) else "-", len(images))
+            if not muted:
+                _emit("message.start", sid)
             prepared = _prepare_turn_input(sid, session, st, text, images)
             if prepared is None:
                 if st.terminal_callback is not None and not st.receipt_attempted:

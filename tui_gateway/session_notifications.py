@@ -160,14 +160,22 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> None:
-    """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure."""
+def _notif_emit_process_status(sid: str, text: str, *, diagnostic: bool) -> None:
+    from gateway.warning_notifications import render_notification
+
     try:
-        from gateway.warning_notifications import render_notification
-        with _session_profile_runtime_scope(session):
-            render_notification(lambda: _emit("message.start", sid), platform="tui",
-                                diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
-        _run_prompt_submit(rid, sid, session, text, **kwargs)
+        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
+                            platform="tui", diagnostic=diagnostic)
+    except Exception as exc:
+        # Presentation is best-effort; the owning session still needs the result.
+        logger.warning("Process status presentation failed (%s)", type(exc).__name__)
+
+
+def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> bool:
+    """Return whether the prompt runner accepted the claimed turn; release on exception."""
+    try:
+        # The prompt runner emits message.start after admission and applies visibility policy.
+        return _run_prompt_submit(rid, sid, session, text, **kwargs)
     except Exception as exc:
         _notif_log_failure(what, exc)
         _notif_release_turn(session)
@@ -194,8 +202,12 @@ def _notif_slash_loop_tick(rid: str, sid: str, session: dict, mgr, wakeup: str) 
             if not _notif_claim_turn(session):
                 mgr.abandon_tick()
                 return
-            # Releases the claim on failure: the swallow below would otherwise leave the session busy for good.
-            _notif_submit(rid, sid, session, payload["message"], "loop wakeup send failed")
+            try:
+                started = _notif_submit(rid, sid, session, payload["message"], "loop wakeup send failed")
+            except Exception:
+                started = False
+            if not started:
+                mgr.abandon_tick()
             return
     except Exception:
         pass
@@ -314,9 +326,8 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         _notif_loop_status(sid, f"↻ /loop wakeup #{mgr.state.ticks_fired if mgr.state else '?'} firing…")
         if wakeup.lstrip().startswith("/"):
             _notif_slash_loop_tick(rid, sid, session, mgr, wakeup)
-        else:
-            _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, wakeup)
+        elif not _run_prompt_submit(rid, sid, session, wakeup):
+            mgr.abandon_tick()
     except Exception as exc:
         _notif_log_failure("loop wakeup dispatch failed", exc)
         _notif_release_turn(session)
@@ -459,12 +470,11 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
     except Exception as exc:
         _notif_log_failure("kanban notification poll failed", exc)
         texts = []
-    for text in texts:
-        from gateway.warning_notifications import DiagnosticText, render_notification
-        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
-                            platform="tui", diagnostic=isinstance(text, DiagnosticText))
     if texts:
+        from gateway.warning_notifications import DiagnosticText
         session.setdefault("_kanban_pending", []).extend(texts)
+        for text in texts:
+            _notif_emit_process_status(sid, text, diagnostic=isinstance(text, DiagnosticText))
     if not session.get("_kanban_pending") or not _notif_claim_turn(session):
         return
     with session["history_lock"]:
@@ -473,11 +483,17 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
         split = not warning_notifications_enabled("tui")
         diagnostic = split and isinstance(pending[0], DiagnosticText)
         batch = [text for text in pending if not split or isinstance(text, DiagnosticText) == diagnostic]
-        session["_kanban_pending"] = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
-    with contextlib.suppress(Exception):
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
-                      "kanban notification dispatch failed",
-                      **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+        remaining = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
+    try:
+        started = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
+                               "kanban notification dispatch failed",
+                               **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+    except Exception:
+        return
+    if started:
+        with session["history_lock"]:
+            session["_kanban_pending"] = remaining
+
 
 
 def _background_notifications_off(session: dict) -> bool:
@@ -517,8 +533,14 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
     if diagnostic_process_event(evt):
         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
     try:
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
+        started = _notif_submit(
+            f"__notif__{int(time.time() * 1000)}", sid, session, text,
+            "notification poller dispatch failed", **kwargs)
     except Exception:
+        release_event_delivery(evt, claim)
+        return False
+    if not started:
+        # Admission already released the turn. Keep the durable result pending for its owner.
         release_event_delivery(evt, claim)
         return False
     complete_event_delivery(evt, claim)
@@ -581,9 +603,7 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         display_text = (async_delegation_display_text(evt) if is_delegation
                         else process_completion_display_text([evt]) if evt_type == "completion" else text)
         from agent.notification_presentation import diagnostic_process_event
-        from gateway.warning_notifications import render_notification
-        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": display_text}),
-                            platform="tui", diagnostic=diagnostic_process_event(evt))
+        _notif_emit_process_status(sid, display_text, diagnostic=diagnostic_process_event(evt))
         emitted.add(dedup_key)
     if evt_type != "async_delegation" and _background_notifications_off(session):
         # The user opted out of process-driven agent wakes: the status row above is the whole
@@ -607,6 +627,16 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     return True
 
 
+def _notif_requeue_completions(events, registry, deferred) -> None:
+    if deferred is not None:
+        deferred.extend(events)
+        return
+    for event in events:
+        registry.completion_queue.put(event)
+    # A refused worker can leave this session idle and the queue nonempty.
+    time.sleep(0.25)
+
+
 def _notif_dispatch_completions(sid, session, notifications, registry, deferred):
     from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
@@ -614,10 +644,7 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
     if not notifications:
         return
     if not _notif_claim_turn(session):
-        for event, _text in notifications:
-            (deferred.append if deferred is not None else registry.completion_queue.put)(event)
-        if deferred is None:
-            time.sleep(0.25)
+        _notif_requeue_completions((event for event, _text in notifications), registry, deferred)
         return
     claimed: list = []
     try:
@@ -626,6 +653,7 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
                 claimed.append((event, event_text, claim))
         batch = ProcessNotificationBatch(tuple((event, event_text) for event, event_text, _claim in claimed))
         text = batch.render(registry)
+        display_text = batch.display_text(registry) if text is not None else None
     except Exception as exc:
         _notif_log_failure("completion batch preparation failed", exc)
         _notif_release_turn(session)
@@ -634,15 +662,19 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
         return
     if text is None:
         _notif_release_turn(session)
-    try:
-        if text is not None:
-            _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
-                          "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
-                          display_metadata={"display_text": batch.display_text(registry)})
-    except Exception:
-        for event, _text, claim in claimed:
-            release_event_delivery(event, claim)
-        return
+    else:
+        try:
+            started = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+                                    "completion batch dispatch failed",
+                                    display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
+                                    display_metadata={"display_text": display_text})
+        except Exception:
+            started = False
+        if not started:
+            for event, _text, claim in claimed:
+                release_event_delivery(event, claim)
+            _notif_requeue_completions((event for event, _text, _claim in claimed), registry, deferred)
+            return
     for event, _text, claim in claimed:
         complete_event_delivery(event, claim)
 
@@ -654,7 +686,14 @@ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, 
         if event.get("type", "completion") != "completion":
             _notif_dispatch_completions(sid, session, completions, registry, deferred)
             completions = []
-        if not _notif_handle_event(sid, session, event, emitted, registry, fmt, deferred, completions, owned=owned):
+        try:
+            keep_draining = _notif_handle_event(
+                sid, session, event, emitted, registry, fmt, deferred, completions, owned=owned)
+        except Exception as exc:
+            # The rest of this snapshot has already been removed from the queue.
+            _notif_log_failure("notification event dispatch failed", exc)
+            continue
+        if not keep_draining:
             for remaining in events[index + 1:]:
                 (deferred.append if deferred is not None else registry.completion_queue.put)(remaining)
             break

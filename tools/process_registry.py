@@ -1906,7 +1906,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                         "type=%s session_id=%s task_id=%s",
                         evt.get("type", "completion"), _evt_sid, _evt_task_id)
                     continue
-            if text := format_process_notification(evt):
+            try:
+                text = format_process_notification(evt)
+            except Exception as exc:
+                # The event has already been dequeued. An unusable payload must
+                # not discard valid results or prevent foreign events requeuing.
+                logger.warning("Skipping malformed process notification (%s)", type(exc).__name__)
+                continue
+            if text:
                 results.append((evt, text))
         for evt in requeue:
             self.completion_queue.put(evt)

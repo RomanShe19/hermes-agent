@@ -1473,6 +1473,27 @@ def test_drain_notifications_completion_callback_exception_fails_closed(registry
     assert registry.completion_queue.empty()
 
 
+def test_drain_notifications_keeps_surrounding_results_and_foreign_event(registry, caplog):
+    mine = [
+        {"type": "completion", "session_id": "proc_ok", "session_key": "a", "exit_code": 0},
+        {"type": "completion", "session_id": "proc_failed", "session_key": "a", "exit_code": 1},
+    ]
+    foreign = {"type": "completion", "session_id": "proc_foreign", "session_key": "b", "exit_code": 0}
+    bad = {"type": "completion", "session_id": "proc_bad", "session_key": "a",
+           "exit_code": ["malformed"], "output": "private-test-output"}
+    for event in (foreign, mine[0], bad, mine[1]):
+        registry.completion_queue.put(event)
+
+    delivered = registry.drain_notifications(session_key="a")
+
+    assert [event for event, _text in delivered] == mine
+    assert "exit code 0" in delivered[0][1]
+    assert "exit code 1" in delivered[1][1]
+    assert [event for event, _text in registry.drain_notifications(session_key="b")] == [foreign]
+    assert registry.completion_queue.empty()
+    assert "TypeError" in caplog.text and "private-test-output" not in caplog.text
+
+
 def test_drain_notifications_filters_async_delegation_by_session_key():
     """Async-delegation events should only be consumed by the matching session's drain.
 

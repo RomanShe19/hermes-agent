@@ -12,6 +12,7 @@ from __future__ import annotations
 import queue
 import sqlite3
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -29,7 +30,11 @@ def _claimed_session() -> dict:
 
 def _no_turn(monkeypatch) -> list:
     started: list = []
-    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: started.append(a))
+    def submit(*args, **kwargs):
+        started.append(args)
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
     return started
 
@@ -84,6 +89,60 @@ def test_a_completion_batch_that_cannot_be_prepared_hands_the_turn_back(monkeypa
     assert released == (["claim-a"] if fail_at == "claim" else ["claim-a", "claim-b"])
 
 
+@pytest.mark.parametrize("defer", [False, True], ids=["poller", "drain"])
+@pytest.mark.parametrize("failure", ["refused", "raised"])
+def test_unstarted_process_completion_batch_is_reoffered_once(monkeypatch, defer, failure):
+    from tools.process_registry import ProcessRegistry
+    from tools.process_registry_notifications import format_process_notification
+
+    registry = ProcessRegistry()
+    session = {"history_lock": threading.RLock(), "running": False, "history": []}
+    events = [
+        {"type": "completion", "session_id": "proc_ok", "exit_code": 0},
+        {"type": "completion", "session_id": "proc_failed", "exit_code": 1},
+    ]
+    prompts, frames, delays = [], [], []
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: frames.append(args))
+    monkeypatch.setattr(server, "_background_notifications_off", lambda session: False)
+    monkeypatch.setattr(server.time, "sleep", delays.append)
+
+    def submit(rid, sid, session, text, **kwargs):
+        prompts.append(text)
+        if len(prompts) == 1:
+            if failure == "raised":
+                raise RuntimeError("worker could not be started")
+            with session["history_lock"]:
+                session["running"] = False
+            return False
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    emitted = set()
+    deferred = [] if defer else None
+    server._notif_handle_ready("sid", session, events, emitted, registry,
+                               format_process_notification, deferred, owned=True)
+
+    assert session["running"] is False
+    if defer:
+        assert deferred == events and registry.completion_queue.empty()
+        retry = deferred[:]
+        deferred.clear()
+    else:
+        retry = [registry.completion_queue.get_nowait() for _ in events]
+    assert retry == events
+    assert delays == ([] if defer else [0.25])
+
+    server._notif_handle_ready("sid", session, retry, emitted, registry,
+                               format_process_notification, deferred, owned=True)
+
+    assert prompts[0] == prompts[1]
+    assert "proc_ok" in prompts[1] and "exit code 0" in prompts[1]
+    assert "proc_failed" in prompts[1] and "exit code 1" in prompts[1]
+    assert len(frames) == len(events)
+    assert registry.completion_queue.empty() and not deferred
+    assert session["running"] is True
+
+
 def test_a_loop_wakeup_whose_send_cannot_start_hands_the_turn_back(monkeypatch):
     """The /loop slash wakeup re-claims the turn for a command that resolves to a prompt, then runs
     the send under ``except Exception: pass`` — which swallowed the only signal that no turn started."""
@@ -100,7 +159,7 @@ def test_a_loop_wakeup_whose_send_cannot_start_hands_the_turn_back(monkeypatch):
     server._notif_slash_loop_tick("rid", "sid", session, mgr, "/skill go")
 
     assert session["running"] is False
-    assert ticks == ["completed"]
+    assert ticks == ["abandoned"]
 
 
 def test_the_poller_thread_survives_a_dispatch_that_raises(monkeypatch):
@@ -133,3 +192,114 @@ def test_the_poller_thread_survives_a_dispatch_that_raises(monkeypatch):
 
     assert not worker.is_alive()
     assert handled == [1, 1], "the second event must still be dispatched after the first one raised"
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_malformed_event_does_not_drop_valid_completions_in_same_snapshot(monkeypatch, shutdown):
+    from tools.process_registry import ProcessRegistry
+    from tools.process_registry_notifications import format_process_notification
+
+    registry = ProcessRegistry()
+    submitted = _no_turn(monkeypatch)
+    monkeypatch.setattr(server, "_background_notifications_off", lambda session: False)
+    faults = []
+    monkeypatch.setattr(server, "_notif_log_failure", lambda stage, error: faults.append(error))
+    session = {"history_lock": threading.RLock(), "running": False, "history": []}
+    events = [
+        {"type": "completion", "session_id": "proc_ok", "exit_code": 0},
+        {"type": "completion", "session_id": "proc_invalid", "exit_code": []},
+        {"type": "completion", "session_id": "proc_failed", "exit_code": 1},
+    ]
+    deferred = [] if shutdown else None
+
+    server._notif_handle_ready("sid", session, events, set(), registry,
+                               format_process_notification, deferred, owned=True)
+
+    assert len(faults) == 1 and isinstance(faults[0], TypeError)
+    assert len(submitted) == 1
+    prompt = submitted[0][3]
+    assert "proc_ok" in prompt and "exit code 0" in prompt
+    assert "proc_failed" in prompt and "exit code 1" in prompt
+    assert "proc_invalid" not in prompt
+
+
+def test_status_sink_failure_does_not_drop_a_valid_process_completion(monkeypatch):
+    from tools.process_registry import ProcessRegistry
+    from tools.process_registry_notifications import format_process_notification
+
+    registry = ProcessRegistry()
+    submitted = _no_turn(monkeypatch)
+    monkeypatch.setattr(server, "_background_notifications_off", lambda session: False)
+
+    def broken_status(event, sid, payload=None):
+        if event == "status.update":
+            raise BrokenPipeError("status sink is unavailable")
+
+    monkeypatch.setattr(server, "_emit", broken_status)
+    session = {"history_lock": threading.RLock(), "running": False, "history": []}
+    events = [{"type": "completion", "session_id": "proc_keep", "exit_code": 0}]
+
+    server._notif_handle_ready("sid", session, events, set(), registry,
+                               format_process_notification, None, owned=True)
+
+    assert len(submitted) == 1
+    assert "proc_keep" in submitted[0][3] and "exit code 0" in submitted[0][3]
+
+
+def test_refused_prompt_keeps_durable_delegation_pending_until_accepted(monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import async_delegation as ledger
+
+    token = set_hermes_home_override(str(tmp_path))
+    try:
+        event = dict(DELEGATION, status="completed")
+        ledger._persist_dispatch(dict(event, dispatched_at=1.0))
+        ledger._persist_completion(event, {"status": "completed"})
+        submitted = []
+        monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+
+        def submit(rid, sid, session, text, **kwargs):
+            submitted.append(text)
+            if len(submitted) == 1:
+                session["running"] = False
+                return False
+            return True
+
+        monkeypatch.setattr(server, "_run_prompt_submit", submit)
+        session = _claimed_session()
+
+        assert server._notif_dispatch_event("sid", session, event, "result") is False
+        row = ledger.get_durable_delegation(event["delegation_id"])
+        assert row["delivery_state"] == "pending"
+        assert row["result"] == {"status": "completed"}
+        pending = queue.Queue()
+        now = time.time()
+        assert ledger.sweep_orphaned_completions(pending, now=now) == 0
+        retry_at = now + ledger._ORPHAN_STALE_S + 1
+        assert ledger.sweep_orphaned_completions(pending, now=retry_at) == 1
+        assert ledger.sweep_orphaned_completions(pending, now=retry_at + 1) == 0
+        replay = pending.get_nowait()
+        assert replay["delegation_id"] == event["delegation_id"]
+        assert server._notif_claim_turn(session) is True
+
+        assert server._notif_dispatch_event("sid", session, replay, "result") is True
+        assert ledger.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+        assert ledger.claim_event_delivery(event, "duplicate-check") is None
+        assert submitted == ["result", "result"]
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_notification_does_not_emit_start_before_prompt_admission(monkeypatch):
+    import contextlib
+
+    frames = []
+    monkeypatch.setattr(server, "_emit", lambda event, sid, *args: frames.append((event, sid)))
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: True)
+    monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda session: contextlib.nullcontext())
+    monkeypatch.setattr(server, "_routing_provenance_db", lambda session: contextlib.nullcontext())
+    monkeypatch.setattr(server, "_admit_prompt_turn", lambda *args: None)
+    monkeypatch.setattr(server, "_start_session_work", lambda *args, **kwargs: pytest.fail("thread started"))
+
+    assert server._notif_submit("req", "sid", _claimed_session(), "notify", "test") is False
+    assert frames == []
