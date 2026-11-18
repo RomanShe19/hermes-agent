@@ -61,3 +61,28 @@ def test_other_sessions_and_old_failures_stay_out():
 
     assert ad.failed_delegations_for_session("ui-1", "agent-1") == []
     assert ad.failed_delegations_for_session() == []
+
+
+def test_grouped_failure_uses_the_call_wide_goal_at_its_index():
+    _delegation(
+        "d-group", status="completed", is_batch=True,
+        goal="publish or archive", goals=["inspect", "test", "publish", "archive"], task_indexes=[2, 3],
+        result={"results": [
+            {"task_index": 2, "status": "completed", "summary": "done"},
+            {"task_index": 3, "status": "error", "error": "missing evidence"},
+        ]},
+    )
+
+    [row] = ad.failed_delegations_for_session("ui-1")
+    assert (row["task_index"], row["goal"], row["error"]) == (3, "archive", "missing evidence")
+
+
+def test_group_crash_without_child_results_uses_a_goal_from_that_group():
+    _delegation(
+        "d-crash", status="error", is_batch=True,
+        goal="archive", goals=["inspect", "test", "archive"], task_indexes=[2],
+        result={"results": [], "error": "worker failed before returning"},
+    )
+
+    [row] = ad.failed_delegations_for_session("ui-1")
+    assert (row["task_index"], row["goal"], row["error"]) == (2, "archive", "worker failed before returning")

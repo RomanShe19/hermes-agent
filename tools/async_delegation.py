@@ -629,10 +629,16 @@ def failed_delegations_for_session(
     for delegation_id, state, dispatched_at, completed_at, task_json, result_json in rows:
         task, result = _json_object(task_json), _json_object(result_json)
         goals = task.get("goals") if isinstance(task.get("goals"), list) and task["goals"] else [task.get("goal") or ""]
-        goal_for = dict(zip(task.get("task_indexes") or range(len(goals)), goals))
+        indexes = task.get("task_indexes") or range(len(goals))
+        # Dispatch persists the whole call's goals; older compact rows pair each goal with its index.
+        if len(indexes) == len(goals):
+            goal_for = dict(zip(indexes, goals))
+        else:
+            goal_for = {i: goals[i] for i in indexes if isinstance(i, int) and 0 <= i < len(goals)}
+        fallback_goal = task.get("goal") or goals[0]
         tasks = result["results"] if isinstance(result.get("results"), list) else [] if task.get("is_batch") else [result]
         if not tasks and str(state).lower() in _FAILED_TASK_STATES:
-            tasks = [{"task_index": 0, "error": result.get("error")}]
+            tasks = [{"task_index": indexes[0], "error": result.get("error")}]
         for entry in tasks:
             status = str(entry.get("status") or state or "").lower()
             if status not in _FAILED_TASK_STATES:
@@ -641,7 +647,7 @@ def failed_delegations_for_session(
             error = entry.get("error") or result.get("error")
             failed.append({
                 "delegation_id": delegation_id, "task_index": index, "status": status,
-                "goal": str(goal_for.get(index, goals[0]) or ""), "error": str(error) if error else None,
+                "goal": str(goal_for.get(index, fallback_goal) or ""), "error": str(error) if error else None,
                 "dispatched_at": dispatched_at, "completed_at": completed_at})
     return failed[:limit]
 
