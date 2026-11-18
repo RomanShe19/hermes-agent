@@ -1120,8 +1120,8 @@ def _stalled_error_text(event_record: dict[str, Any]) -> str:
     label = f'Background task "{goal[:120]}"' if goal else "The background task"
     quiet = float(event_record.get("_stall_quiet_seconds") or 0)
     silence = f" after {round(quiet / 60)} min of no progress" if quiet >= 60 else ""
-    return (f"{label} stopped responding{silence} and was cancelled. Nothing else was affected; "
-            "ask me to run it again if you still need it.")
+    return (f"{label} stopped responding{silence}. Hermes could not confirm that it stopped. "
+            "Check saved results and running work before retrying.")
 
 
 def _stalled_result(delegation_id: str, event_record: dict[str, Any]) -> dict[str, Any]:

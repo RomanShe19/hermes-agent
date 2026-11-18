@@ -292,7 +292,10 @@ def test_stalled_runner_is_interrupted_then_finalized(monkeypatch):
         assert evt["status"] == "stalled"
         assert evt["delegation_id"] == res["delegation_id"]
         assert evt["api_calls"] == 0
-        assert "stopped responding" in evt["error"]  # status carries "stalled"; the text is for the user
+        assert "stopped responding" in evt["error"]
+        assert "Hermes could not confirm that it stopped" in evt["error"]
+        assert "Check saved results and running work before retrying" in format_process_notification(evt)
+        assert not gate.is_set()  # The worker has yet to return.
         # Interrupt was requested BEFORE force-finalization (grace window).
         assert interrupted["count"] >= 1
         assert ad.active_count() == 0
