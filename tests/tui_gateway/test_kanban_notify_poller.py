@@ -12,6 +12,7 @@ unsubscribe) and ``_format_kanban_event_text``.
 """
 
 from types import SimpleNamespace
+import pytest
 from unittest.mock import patch
 
 from hermes_cli import kanban_db as kb
@@ -268,11 +269,12 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        monkeypatch.setattr(
-            server,
-            "_run_prompt_submit",
-            lambda rid, sid, sess, text: submits.append(text),
-        )
+        def accept_turn(rid, sid, session, text, **kwargs):
+            server._emit("message.start", sid)
+            submits.append(text)
+            return True
+
+        monkeypatch.setattr(server, "_run_prompt_submit", accept_turn)
         stop = threading.Event()
         thread = threading.Thread(
             target=server._notification_poller_loop,
@@ -347,3 +349,33 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(tid in text for text in submits), submits
         assert session["_kanban_pending"] == []
         assert session["running"] is True
+
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_cursor_claimed_event_survives_refused_turn(self, monkeypatch, raises):
+        from tui_gateway import server
+
+        task_id = _create_subscribed_task()
+        _complete(task_id, summary="keep until admitted")
+        session = self._poller_session()
+        submitted, emitted = [], []
+        monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: emitted.append(event))
+
+        def submit(rid, sid, current, text, **kwargs):
+            submitted.append(text)
+            if len(submitted) == 1:
+                if raises:
+                    raise RuntimeError("thread start failed")
+                current["running"] = False  # The prompt runner releases on refusal.
+                return False
+            return True
+
+        monkeypatch.setattr(server, "_run_prompt_submit", submit)
+        server._notif_poll_kanban("sid", session)
+        assert session["running"] is False
+        assert len(session["_kanban_pending"]) == 1
+        assert task_id in session["_kanban_pending"][0]
+
+        server._notif_poll_kanban("sid", session)
+        assert session["_kanban_pending"] == []
+        assert submitted[0] == submitted[1]
+        assert emitted.count("status.update") == 1

@@ -470,11 +470,17 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
         split = not warning_notifications_enabled("tui")
         diagnostic = split and isinstance(pending[0], DiagnosticText)
         batch = [text for text in pending if not split or isinstance(text, DiagnosticText) == diagnostic]
-        session["_kanban_pending"] = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
-    with contextlib.suppress(Exception):
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
-                      "kanban notification dispatch failed",
-                      **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+        remaining = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
+    try:
+        started = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
+                               "kanban notification dispatch failed",
+                               **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+    except Exception:
+        return
+    if started:
+        with session["history_lock"]:
+            session["_kanban_pending"] = remaining
+
 
 
 def _background_notifications_off(session: dict) -> bool:
