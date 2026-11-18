@@ -712,18 +712,18 @@ def _action_create(a: dict[str, Any]) -> str:
         "success": True, "job_id": job["id"], "name": job["name"], "skill": job.get("skill"),
         "skills": job.get("skills", []), "schedule": job["schedule_display"], "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"), "next_run_at": job["next_run_at"], "job": _format_job(job),
-        "message": _create_message, **_gateway_liveness_notice(),
+        "message": _create_message,
     }
+    if job.get("enabled", True):
+        _result.update(_gateway_liveness_notice())
     return _dumps(_with_guidance(_result, job, deliver))
 
 
 def _action_list(a: dict[str, Any]) -> str:
     jobs = [_format_job(job) for job in list_jobs(include_disabled=a["include_disabled"])]
     _result = {"success": True, "count": len(jobs), "jobs": jobs}
-    # Same inert-job class as create; an empty list has nothing inert.
-    if jobs:
-        # Same silent-inert-job class as create (#87033): an agent inspecting existing jobs in a
-        # gateway-less environment must learn they are not firing, not just see a clean list.
+    # Paused jobs need an explicit resume even when the gateway is running.
+    if any(job["enabled"] for job in jobs):
         _result.update(_gateway_liveness_notice(plural=True))
     return _dumps(_result)
 

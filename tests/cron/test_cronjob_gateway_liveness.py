@@ -332,3 +332,36 @@ def test_paused_job_changes_stay_quiet_without_gateway(hermes_env):
         assert result["success"] is True
         assert result["job"]["enabled"] is False
         assert "warning" not in result
+
+
+def test_create_paused_and_list_disabled_do_not_warn_about_gateway(hermes_env):
+    from tools.cronjob_tools import cronjob
+
+    with patch_liveness(provider="builtin", pids=[]):
+        paused = json.loads(cronjob(
+            action="create", schedule="every 10m", prompt="say hi", deliver="local", paused=True,
+        ))
+        listed = json.loads(cronjob(action="list", include_disabled=True))
+
+    assert paused["success"] is True
+    assert paused["job"]["enabled"] is False
+    assert "warning" not in paused
+    assert listed["success"] is True
+    assert listed["count"] == 1
+    assert "warning" not in listed
+
+
+def test_list_mixed_jobs_warns_only_for_enabled_jobs(hermes_env):
+    from tools.cronjob_tools import cronjob
+
+    paused_id = _create_job()["job_id"]
+    cronjob(action="pause", job_id=paused_id)
+    _create_job()
+
+    with patch_liveness(provider="builtin", pids=[]):
+        result = json.loads(cronjob(action="list", include_disabled=True))
+
+    assert result["success"] is True
+    assert result["count"] == 2
+    assert result["gateway_running"] is False
+    assert "enabled jobs" in result["warning"]
