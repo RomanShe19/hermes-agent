@@ -1221,3 +1221,35 @@ def test_prune_never_evicts_live_records():
 
     assert {"live-stalling", "live-finalizing", "live-running"} <= survivors
     assert "done-0" not in survivors and len(survivors - {"live-stalling", "live-finalizing", "live-running"}) == ad._MAX_RETAINED_COMPLETED
+
+
+def test_stalled_group_preserves_child_results_in_delivery_and_history(monkeypatch):
+    _fast_stale_monitor(monkeypatch)
+    delegation_id = "deleg_stalled_group"
+    release = threading.Event()
+    finished = {"task_index": 1, "status": "completed", "summary": "verified backup"}
+
+    def runner():
+        ad.record_unit_child(delegation_id, finished)
+        release.wait(timeout=10)
+        return {"results": [finished]}
+
+    handle = ad.dispatch_async_delegation_batch(
+        goals=["separate group", "verify backup", "other group", "resume inspection"],
+        task_indexes=[1, 3], delegation_id=delegation_id, context=None, toolsets=None,
+        role="leaf", model=None, session_key="", parent_session_id="parent-of-stalled-group",
+        runner=runner, progress_fn=lambda: ((0, None), False),
+    )
+    try:
+        assert handle["status"] == "dispatched"
+        event = _drain_for(delegation_id)
+        assert event is not None and event["status"] == "stalled"
+        finished_result, unfinished_result = event["results"]
+        assert finished_result == finished
+        assert (unfinished_result["task_index"], unfinished_result["status"]) == (3, "unknown")
+        assert ad.get_durable_delegation(delegation_id)["result"]["results"] == event["results"]
+        assert "verified backup" in format_process_notification(event)
+        [failed] = ad.failed_delegations_for_session(parent_session_id="parent-of-stalled-group")
+        assert (failed["task_index"], failed["goal"], failed["status"]) == (3, "resume inspection", "unknown")
+    finally:
+        release.set()

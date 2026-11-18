@@ -206,6 +206,15 @@ def _prune_durable_records() -> None:
 def _persist_completion(event: dict[str, Any], result: dict[str, Any]) -> None:
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
+        # The stall monitor has no joined result. Merge saved children under the same
+        # lock as record_unit_child so the queued event and durable row agree.
+        if event.get("status") == "stalled" and event.get("is_batch") and not event.get("results"):
+            row = conn.execute(
+                "SELECT task_json, result_json FROM async_delegations WHERE delegation_id=?",
+                (event["delegation_id"],),
+            ).fetchone()
+            if row and (recovered := _recovered_results(_json_object(row[0]), row[1], event["error"])):
+                event["results"] = result["results"] = recovered
         conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?, delivery_state='pending'
                WHERE delegation_id=?""",
@@ -235,7 +244,7 @@ def record_unit_child(delegation_id: str, entry: dict[str, Any]) -> None:
 
 def _recovered_results(task: dict[str, Any], result_json: Optional[str], error: str) -> Optional[list[dict[str, Any]]]:
     """Per-task results for an abandoned unit: recorded children as they finished, the rest ``unknown``."""
-    partial = json.loads(result_json or "{}") or {}
+    partial = _json_object(result_json)
     if not (task.get("is_batch") and partial.get("partial") and partial.get("results")):
         return None
     recorded = {r["task_index"]: r for r in partial["results"] if isinstance(r.get("task_index"), int)}
