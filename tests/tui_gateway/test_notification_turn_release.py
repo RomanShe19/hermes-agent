@@ -133,3 +133,32 @@ def test_the_poller_thread_survives_a_dispatch_that_raises(monkeypatch):
 
     assert not worker.is_alive()
     assert handled == [1, 1], "the second event must still be dispatched after the first one raised"
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_malformed_event_does_not_drop_valid_completions_in_same_snapshot(monkeypatch, shutdown):
+    from tools.process_registry import ProcessRegistry
+    from tools.process_registry_notifications import format_process_notification
+
+    registry = ProcessRegistry()
+    submitted = _no_turn(monkeypatch)
+    monkeypatch.setattr(server, "_background_notifications_off", lambda session: False)
+    faults = []
+    monkeypatch.setattr(server, "_notif_log_failure", lambda stage, error: faults.append(error))
+    session = {"history_lock": threading.RLock(), "running": False, "history": []}
+    events = [
+        {"type": "completion", "session_id": "proc_ok", "exit_code": 0},
+        {"type": "completion", "session_id": "proc_invalid", "exit_code": []},
+        {"type": "completion", "session_id": "proc_failed", "exit_code": 1},
+    ]
+    deferred = [] if shutdown else None
+
+    server._notif_handle_ready("sid", session, events, set(), registry,
+                               format_process_notification, deferred, owned=True)
+
+    assert len(faults) == 1 and isinstance(faults[0], TypeError)
+    assert len(submitted) == 1
+    prompt = submitted[0][3]
+    assert "proc_ok" in prompt and "exit code 0" in prompt
+    assert "proc_failed" in prompt and "exit code 1" in prompt
+    assert "proc_invalid" not in prompt

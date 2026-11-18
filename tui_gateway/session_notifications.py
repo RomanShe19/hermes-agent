@@ -654,7 +654,14 @@ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, 
         if event.get("type", "completion") != "completion":
             _notif_dispatch_completions(sid, session, completions, registry, deferred)
             completions = []
-        if not _notif_handle_event(sid, session, event, emitted, registry, fmt, deferred, completions, owned=owned):
+        try:
+            keep_draining = _notif_handle_event(
+                sid, session, event, emitted, registry, fmt, deferred, completions, owned=owned)
+        except Exception as exc:
+            # The rest of this snapshot has already been removed from the queue.
+            _notif_log_failure("notification event dispatch failed", exc)
+            continue
+        if not keep_draining:
             for remaining in events[index + 1:]:
                 (deferred.append if deferred is not None else registry.completion_queue.put)(remaining)
             break
