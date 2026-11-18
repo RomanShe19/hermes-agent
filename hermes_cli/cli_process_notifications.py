@@ -1,6 +1,25 @@
 """CLI notification ownership, structured queueing and last-moment consumption."""
 
 
+import logging
+
+from tools.process_registry_notifications import TimelineNotification
+
+logger = logging.getLogger("cli")
+
+
+class _QueuedDelegationNotification(TimelineNotification):
+    event: dict
+    consumer: str
+
+    @classmethod
+    def from_event(cls, text: str, event: dict, consumer: str):
+        pending = cls.for_delegation(text, event)
+        pending.event = event
+        pending.consumer = consumer
+        return pending
+
+
 class CLIProcessNotificationsMixin:
     def _owns_process_notification(self, event: dict) -> bool:
         """Whether this session owns a delegation event (pre-compression keys resolve to their continuation; fail closed)."""
@@ -35,20 +54,24 @@ class CLIProcessNotificationsMixin:
 
     def _drain_process_notifications(self, consumer: str) -> None:
         from tools.process_registry import process_registry
-        from tools.async_delegation import claim_event_delivery, complete_event_delivery
+        from tools.async_delegation import (
+            claim_event_delivery, complete_event_delivery, maybe_sweep_orphaned_completions)
         from tools.process_registry_notifications import (
             HEARTBEAT_DISPLAY_KIND, ProcessNotificationBatch, TimelineNotification, group_process_notifications,
             heartbeat_display_text)
 
-        claimed = []
-        for event, text in process_registry.drain_notifications(
+        events = process_registry.drain_notifications(
             session_key=getattr(self, "session_id", "") or "", owns_event=self._owns_process_notification,
-        ):
-            claim = claim_event_delivery(event, consumer)
-            if claim is None:
-                continue
+        )
+        maybe_sweep_orphaned_completions(process_registry.completion_queue)
+        claimed = []
+        for event, text in events:
+            if event.get("type") != "async_delegation":
+                claim = claim_event_delivery(event, consumer)
+                if claim is None:
+                    continue
+                complete_event_delivery(event, claim)
             claimed.append((event, text))
-            complete_event_delivery(event, claim)
         if self._background_notifications_suppressed():
             # Subagent results are not process notifications: they still land.
             claimed = [(event, text) for event, text in claimed if event.get("type") == "async_delegation"]
@@ -59,12 +82,47 @@ class CLIProcessNotificationsMixin:
                 pending = ProcessNotificationBatch(notifications)
             elif evt_type == "heartbeat":
                 pending = TimelineNotification(text, heartbeat_display_text(event), HEARTBEAT_DISPLAY_KIND)
+            elif evt_type == "async_delegation":
+                pending = _QueuedDelegationNotification.from_event(text, event, consumer)
             else:
-                pending = TimelineNotification.for_delegation(text, event) if evt_type == "async_delegation" else text
                 from agent.notification_presentation import diagnostic_process_event
-                if diagnostic_process_event(event) and not isinstance(pending, TimelineNotification):
-                    pending = TimelineNotification(text, text, "internal_notification", "diagnostic")
+                pending = (TimelineNotification(text, text, "internal_notification", "diagnostic")
+                           if diagnostic_process_event(event) else text)
             self._pending_input.put(pending)
+
+    def _run_queued_delegation(self, notification: _QueuedDelegationNotification, run_turn):
+        """Claim at turn admission, after any queued session switch, and ack a started worker."""
+        from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
+        from tools.process_registry import process_registry
+
+        event = notification.event
+        if not self._owns_process_notification(event):
+            process_registry.completion_queue.put(event)
+            return None
+        try:
+            claim = claim_event_delivery(event, notification.consumer)
+        except Exception as exc:
+            process_registry.completion_queue.put(event)
+            logger.warning("Could not claim CLI delegation completion (%s)", type(exc).__name__)
+            return None
+        if claim is None:
+            return None
+
+        started = False
+
+        def acknowledge_start() -> None:
+            nonlocal started
+            started = True
+            try:
+                complete_event_delivery(event, claim)
+            except Exception as exc:
+                logger.warning("Could not acknowledge CLI delegation completion (%s)", type(exc).__name__)
+
+        try:
+            return run_turn(notification, on_started=acknowledge_start)
+        finally:
+            if not started:
+                release_event_delivery(event, claim)
 
     def _tui_unwrap_input(self, user_input):
         """Unwrap ``_VoiceInputMessage`` / ``_SeededQueryMessage`` -> ``(text_or_tuple, is_voice_input, is_seeded_query)``."""

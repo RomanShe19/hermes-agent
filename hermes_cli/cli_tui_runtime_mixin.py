@@ -60,6 +60,13 @@ class CLITuiRuntimeMixin:
                 step()
 
     def _tui_process_one_input(self, user_input):
+        from hermes_cli.cli_process_notifications import _QueuedDelegationNotification
+
+        if isinstance(user_input, _QueuedDelegationNotification):
+            return self._run_queued_delegation(user_input, self._tui_process_routed_input)
+        return self._tui_process_routed_input(user_input)
+
+    def _tui_process_routed_input(self, user_input, *, on_started=None):
         """Route one submitted input: file drop, /resume pick, ! shell, slash command, or a chat turn."""
         from cli import _DIM, _PASTE_REF_RE, _RST, _cprint, _detect_file_drop, _looks_like_slash_command, _strip_leaked_bracketed_paste_wrappers, _strip_leaked_terminal_responses_with_meta
         from tools.process_registry_notifications import TimelineNotification
@@ -122,7 +129,9 @@ class CLITuiRuntimeMixin:
         self._turn_summary_begin()
         self._app.invalidate()
         try:
-            self.chat(notification_preview or user_input, images=submit_images or None, voice_input=is_voice_input)
+            options = {"on_started": on_started} if on_started is not None else {}
+            return self.chat(notification_preview or user_input, images=submit_images or None,
+                             voice_input=is_voice_input, **options)
         finally:
             self._tui_after_turn()
 
