@@ -238,3 +238,19 @@ def test_nonfinite_marker_preserves_background_dispatch(harness, monkeypatch, ma
     if api_history:
         assert event["origin_session_id"] == "history-session"
     assert all(child.closed.wait(2) for child in children)
+
+
+def test_cli_completion_marks_iteration_limit_as_partial(monkeypatch):
+    from tools import delegate_tool_dispatch as dispatch
+
+    lines = []
+    monkeypatch.setattr(dispatch, "_print_completion_line", lambda _parent, _spinner, line: lines.append(line))
+    for exit_reason in ("max_iterations", "completed"):
+        dispatch._report_child_done(
+            None, None, {"task_index": 0, "status": "completed", "exit_reason": exit_reason},
+            "", ["Verify results"], 1, 0,
+        )
+
+    partial, complete = lines
+    assert partial.startswith("⚠") and "iteration limit" in partial.lower()
+    assert complete.startswith("✓") and "iteration limit" not in complete.lower()

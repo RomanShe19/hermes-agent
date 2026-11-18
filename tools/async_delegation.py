@@ -634,6 +634,8 @@ def failed_delegations_for_session(
                 WHERE ({owner_sql}) AND state NOT IN ('running','finalizing') AND completed_at >= ?
                 ORDER BY completed_at DESC LIMIT ?""",
             (*(val for _, val in selectors), cutoff, limit)).fetchall()
+    from tools.process_registry_notifications import DELEGATION_ITERATION_LIMIT_NOTE, is_delegation_truncated
+
     failed: list[dict[str, Any]] = []
     for delegation_id, state, dispatched_at, completed_at, task_json, result_json in rows:
         task, result = _json_object(task_json), _json_object(result_json)
@@ -650,10 +652,13 @@ def failed_delegations_for_session(
             tasks = [{"task_index": indexes[0], "error": result.get("error")}]
         for entry in tasks:
             status = str(entry.get("status") or state or "").lower()
+            error = entry.get("error") or result.get("error")
+            if status in {"completed", "success"} and is_delegation_truncated(entry):
+                status = "failed"
+                error = DELEGATION_ITERATION_LIMIT_NOTE
             if status not in _FAILED_TASK_STATES:
                 continue
             index = entry.get("task_index") if isinstance(entry.get("task_index"), int) else 0
-            error = entry.get("error") or result.get("error")
             failed.append({
                 "delegation_id": delegation_id, "task_index": index, "status": status,
                 "goal": str(goal_for.get(index, fallback_goal) or ""), "error": str(error) if error else None,

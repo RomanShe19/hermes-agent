@@ -645,17 +645,22 @@ class TestDelegateFailedChildStatus(unittest.TestCase):
     would render the false "TRUNCATED" banner).
     """
 
-    def _delegate_single(self, child_result):
+    def _delegate_single(self, child_result, progress_callback=None):
         """Dispatch a single task whose mock child returns `child_result`,
         returning the parsed child result entry dict."""
         parent = _make_mock_parent(depth=0)
+        parent.tool_progress_callback = progress_callback
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
             mock_child.model = "claude-sonnet-4-6"
             mock_child.session_prompt_tokens = 0
             mock_child.session_completion_tokens = 0
             mock_child.run_conversation.return_value = child_result
-            MockAgent.return_value = mock_child
+            def build_child(**kwargs):
+                mock_child.tool_progress_callback = kwargs.get("tool_progress_callback")
+                return mock_child
+
+            MockAgent.side_effect = build_child
             result = json.loads(
                 delegate_task(goal="Test child status", parent_agent=parent)
             )
@@ -710,6 +715,7 @@ class TestDelegateFailedChildStatus(unittest.TestCase):
         summary must keep status=completed, exit_reason=max_iterations, and
         truncated=True. This is the legitimate truncation path we must not
         break while making failure labels honest."""
+        progress = MagicMock()
         entry = self._delegate_single(
             {
                 "final_response": "made partial progress before the budget ran out",
@@ -717,11 +723,16 @@ class TestDelegateFailedChildStatus(unittest.TestCase):
                 "interrupted": False,
                 "api_calls": 10,
                 "messages": [],
-            }
+            },
+            progress_callback=progress,
         )
         self.assertEqual(entry["status"], "completed")
         self.assertEqual(entry["exit_reason"], "max_iterations")
         self.assertTrue(entry["truncated"])
+        [event] = [c.kwargs for c in progress.call_args_list if c.args and c.args[0] == "subagent.complete"]
+        self.assertEqual(event["status"], "failed")
+        self.assertIn("Iteration limit reached", event["summary"])
+        self.assertIn(entry["summary"], event["summary"])
 
     def test_interrupted_unchanged(self):
         """Interrupted children keep status=interrupted + exit_reason=interrupted

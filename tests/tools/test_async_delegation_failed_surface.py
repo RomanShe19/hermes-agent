@@ -86,3 +86,17 @@ def test_group_crash_without_child_results_uses_a_goal_from_that_group():
 
     [row] = ad.failed_delegations_for_session("ui-1")
     assert (row["task_index"], row["goal"], row["error"]) == (2, "archive", "worker failed before returning")
+
+
+def test_iteration_limit_remains_visible_after_reconnect():
+    _delegation(
+        "d-cut", status="completed", is_batch=True, goals=["prepare", "verify"],
+        result={"results": [
+            {"task_index": 0, "status": "completed", "summary": "done", "exit_reason": "completed"},
+            {"task_index": 1, "status": "completed", "summary": "partial", "exit_reason": "max_iterations"},
+        ]},
+    )
+
+    [row] = ad.failed_delegations_for_session("ui-reminted", "agent-1")
+    assert (row["task_index"], row["goal"], row["status"]) == (1, "verify", "failed")
+    assert "iteration limit" in row["error"].lower()

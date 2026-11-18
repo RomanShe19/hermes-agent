@@ -15,6 +15,7 @@ from agent.compression_marker import elide
 from agent.interrupt_compat import request_hard_interrupt
 from dataclasses import dataclass, field
 from tools import file_state
+from tools.process_registry_notifications import DELEGATION_ITERATION_LIMIT_NOTE, is_delegation_truncated
 from tools.delegate_tool_progress import _quiet, _safe_progress
 from tools.delegate_tool_registry import (
     _capture_gateway_steer_authority, _close_subagent_steering, _register_subagent, _unregister_subagent,
@@ -1020,9 +1021,13 @@ class _ChildRun:
         _files_written_map: dict = {}
         with _quiet(None):
             _files_written_map = file_state.writes_since("", self.wall_start, [])  # all writes since wall_start
+        status = entry["status"]
+        if status == "completed" and is_delegation_truncated(entry):
+            status = "failed"
+            summary = f"{DELEGATION_ITERATION_LIMIT_NOTE} {summary}"
         complete_kwargs: dict[str, Any] = {
             "preview": summary[:160] if summary else entry.get("error", ""),
-            "status": entry["status"],
+            "status": status,
             "duration_seconds": duration,
             "summary": summary[:500] if summary else entry.get("error", ""),
             "input_tokens": _num(getattr(child, "session_prompt_tokens", 0)),

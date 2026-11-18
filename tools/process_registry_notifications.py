@@ -146,7 +146,10 @@ _TRUNCATED_SUMMARY_NOTE = (
     "the unfinished part.]")
 
 
-def _is_truncated(entry: dict) -> bool:
+DELEGATION_ITERATION_LIMIT_NOTE = "Iteration limit reached. Verify the partial result before continuing."
+
+
+def is_delegation_truncated(entry: dict) -> bool:
     return bool(entry.get("truncated") or entry.get("exit_reason") == "max_iterations")
 
 
@@ -233,7 +236,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     # delegation model fails every task identically and must not stay buried.
     lines += _notice_lines(results)
     for r in sorted(results, key=lambda x: x.get("task_index", 0)):
-        idx, r_truncated = r.get("task_index", 0), _is_truncated(r)
+        idx, r_truncated = r.get("task_index", 0), is_delegation_truncated(r)
         r_status, r_summary, r_error = r.get("status", "?"), r.get("summary"), r.get("error")
         r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
         icon = "⚠" if r_truncated else ("✓" if r_status in _DONE else "✗")
@@ -288,7 +291,7 @@ def _format_async_delegation(evt: dict) -> str:
     if evt.get("is_batch") or isinstance(evt.get("results"), list):
         return _format_batch_delegation(evt, deleg_id, completed_at)
     status, summary, error = evt.get("status") or "completed", evt.get("summary"), evt.get("error")
-    truncated = _is_truncated(evt)
+    truncated = is_delegation_truncated(evt)
     lines = _preamble(
         evt,
         f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
@@ -328,7 +331,7 @@ def async_delegation_display_text(evt: dict) -> str:
                      "unknown": "Unknown", "rejected": "Failed"}
     for result in results:
         status = result.get("status") or ("failed" if result.get("error") else "completed")
-        label = ("Incomplete" if _is_truncated(result) else "Completed") if status in _DONE else (
+        label = ("Incomplete" if is_delegation_truncated(result) else "Completed") if status in _DONE else (
             status_labels.get(status, "Incomplete"))
         labels.append(label)
         index = result.get("task_index", 0)
