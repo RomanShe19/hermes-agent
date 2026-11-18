@@ -160,14 +160,14 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> None:
-    """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure."""
+def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> bool:
+    """Return whether the prompt runner accepted the claimed turn; release on exception."""
     try:
         from gateway.warning_notifications import render_notification
         with _session_profile_runtime_scope(session):
             render_notification(lambda: _emit("message.start", sid), platform="tui",
                                 diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
-        _run_prompt_submit(rid, sid, session, text, **kwargs)
+        return _run_prompt_submit(rid, sid, session, text, **kwargs)
     except Exception as exc:
         _notif_log_failure(what, exc)
         _notif_release_turn(session)
@@ -517,8 +517,14 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
     if diagnostic_process_event(evt):
         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
     try:
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
+        started = _notif_submit(
+            f"__notif__{int(time.time() * 1000)}", sid, session, text,
+            "notification poller dispatch failed", **kwargs)
     except Exception:
+        release_event_delivery(evt, claim)
+        return False
+    if not started:
+        # Admission already released the turn. Keep the durable result pending for its owner.
         release_event_delivery(evt, claim)
         return False
     complete_event_delivery(evt, claim)

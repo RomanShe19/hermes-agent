@@ -162,3 +162,39 @@ def test_malformed_event_does_not_drop_valid_completions_in_same_snapshot(monkey
     assert "proc_ok" in prompt and "exit code 0" in prompt
     assert "proc_failed" in prompt and "exit code 1" in prompt
     assert "proc_invalid" not in prompt
+
+
+def test_refused_prompt_keeps_durable_delegation_pending_until_accepted(monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import async_delegation as ledger
+
+    token = set_hermes_home_override(str(tmp_path))
+    try:
+        event = dict(DELEGATION, status="completed")
+        ledger._persist_dispatch(dict(event, dispatched_at=1.0))
+        ledger._persist_completion(event, {"status": "completed"})
+        submitted = []
+        monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+
+        def submit(rid, sid, session, text, **kwargs):
+            submitted.append(text)
+            if len(submitted) == 1:
+                session["running"] = False
+                return False
+            return True
+
+        monkeypatch.setattr(server, "_run_prompt_submit", submit)
+        session = _claimed_session()
+
+        assert server._notif_dispatch_event("sid", session, event, "result") is False
+        row = ledger.get_durable_delegation(event["delegation_id"])
+        assert row["delivery_state"] == "pending"
+        assert row["result"] == {"status": "completed"}
+        assert server._notif_claim_turn(session) is True
+
+        assert server._notif_dispatch_event("sid", session, event, "result") is True
+        assert ledger.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+        assert ledger.claim_event_delivery(event, "duplicate-check") is None
+        assert submitted == ["result", "result"]
+    finally:
+        reset_hermes_home_override(token)
