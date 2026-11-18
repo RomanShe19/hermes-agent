@@ -207,3 +207,20 @@ def test_refused_prompt_keeps_durable_delegation_pending_until_accepted(monkeypa
         assert submitted == ["result", "result"]
     finally:
         reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_notification_start_frame_follows_prompt_admission_once(monkeypatch, accepted):
+    import contextlib
+
+    frames = []
+    monkeypatch.setattr(server, "_emit", lambda event, sid, *args: frames.append((event, sid)))
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: True)
+    monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda session: contextlib.nullcontext())
+    monkeypatch.setattr(server, "_routing_provenance_db", lambda session: contextlib.nullcontext())
+    monkeypatch.setattr(server, "_admit_prompt_turn",
+                        lambda *args: ([], SimpleNamespace(session_id="test")) if accepted else None)
+    monkeypatch.setattr(server, "_start_session_work", lambda *args, **kwargs: object())
+
+    assert server._notif_submit("req", "sid", _claimed_session(), "notify", "test") is accepted
+    assert frames == ([("message.start", "sid")] if accepted else [])
