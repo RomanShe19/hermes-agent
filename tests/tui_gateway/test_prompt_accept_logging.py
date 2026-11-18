@@ -6,8 +6,8 @@ was an *absence*: a Desktop request left no INFO record in ``agent.log`` or
 muted window was structurally indistinguishable from a request that never
 arrived. This suite pins the two-record contract that fixes that:
 
-* ``_run_prompt_submit`` logs one ``tui prompt accepted`` INFO record before
-  the turn thread starts, carrying the UI session id, the gateway
+* ``_run_prompt_submit`` logs one ``tui prompt accepted`` INFO record from
+  the started turn thread, carrying the UI session id, the gateway
   ``session_key``, and the agent's live ``session_id`` (rotated independently
   by compression — the triple is what a rotation-mute trace needs).
 * The turn's ``finally`` logs exactly one ``tui turn finished`` bookend on
@@ -145,3 +145,18 @@ def test_turn_settles_before_post_turn_trim(turn_stubs, monkeypatch, caplog, set
     finally:
         release.set()
         session["_run_thread"].join(timeout=5)
+
+
+def test_refused_thread_start_emits_no_acceptance_or_start(turn_stubs, monkeypatch, caplog):
+    frames = []
+    monkeypatch.setattr(server, "_emit", lambda event, *args: frames.append(event))
+    monkeypatch.setattr(server, "_start_session_work", lambda *args, **kwargs: None)
+    agent = types.SimpleNamespace(session_id="agent-sid-1", clear_interrupt=lambda: None)
+    session = _session(agent=agent, running=True)
+
+    with caplog.at_level(logging.INFO, logger="tui_gateway.server"):
+        assert server._run_prompt_submit("rid", "ui-sid", session, "ok") is False
+
+    assert session["running"] is False
+    assert "message.start" not in frames
+    assert not _records(caplog, "tui prompt accepted")

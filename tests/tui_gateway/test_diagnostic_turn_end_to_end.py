@@ -36,6 +36,10 @@ def test_diagnostic_turn_runs_but_never_echoes_on_wire(turn_env, marker_home, mo
     assert controls == [("Recovery approval?", ["yes", "no"])]
     content_frames = [f for f in frames if (f.get("params") or {}).get("type") in {"message.delta", "message.interim", "message.complete", "error"}]
     assert bool(content_frames) is not suppress
+    starts = [f for f in frames if (f.get("params") or {}).get("type") == "message.start"]
+    assert len(starts) == (0 if suppress else 1)
+    if not suppress:
+        assert frames.index(starts[0]) < frames.index(content_frames[0])
     assert session["running"] is False
 
 
