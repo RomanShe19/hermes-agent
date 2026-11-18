@@ -540,7 +540,7 @@ def _gateway_liveness_notice(plural: bool = False) -> dict:
     except Exception:
         return {"gateway_running": None}
     if _gw is False:
-        subject = "these jobs are saved" if plural else "this job is saved"
+        subject = "the enabled jobs are saved" if plural else "this job is saved"
         return {
             "gateway_running": False,
             "warning": (

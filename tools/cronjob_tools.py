@@ -712,18 +712,18 @@ def _action_create(a: dict[str, Any]) -> str:
         "success": True, "job_id": job["id"], "name": job["name"], "skill": job.get("skill"),
         "skills": job.get("skills", []), "schedule": job["schedule_display"], "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"), "next_run_at": job["next_run_at"], "job": _format_job(job),
-        "message": _create_message, **_gateway_liveness_notice(),
+        "message": _create_message,
     }
+    if job.get("enabled", True):
+        _result.update(_gateway_liveness_notice())
     return _dumps(_with_guidance(_result, job, deliver))
 
 
 def _action_list(a: dict[str, Any]) -> str:
     jobs = [_format_job(job) for job in list_jobs(include_disabled=a["include_disabled"])]
     _result = {"success": True, "count": len(jobs), "jobs": jobs}
-    # Same inert-job class as create; an empty list has nothing inert.
-    if jobs:
-        # Same silent-inert-job class as create (#87033): an agent inspecting existing jobs in a
-        # gateway-less environment must learn they are not firing, not just see a clean list.
+    # Paused jobs need an explicit resume even when the gateway is running.
+    if any(job["enabled"] for job in jobs):
         _result.update(_gateway_liveness_notice(plural=True))
     return _dumps(_result)
 
@@ -740,9 +740,12 @@ def _action_remove(job: dict[str, Any], a: dict[str, Any]) -> str:
     })
 
 
-def _job_state_result(updated: dict[str, Any]) -> str:
+def _job_state_payload(updated: dict[str, Any]) -> dict[str, Any]:
     _notify_provider_jobs_changed_safe()
-    return _dumps({"success": True, "job": _format_job(updated)})
+    result = {"success": True, "job": _format_job(updated)}
+    if updated.get("enabled", True):
+        result.update(_gateway_liveness_notice())
+    return result
 
 
 def _refreshed_job_view(job_id: str) -> dict[str, Any]:
@@ -948,18 +951,17 @@ def _action_update(job: dict[str, Any], a: dict[str, Any]) -> str:
     if not updates:
         return tool_error("No updates provided.", success=False)
     updated = update_job(job["id"], updates)
-    _notify_provider_jobs_changed_safe()
     # An update can switch modes or delivery — echo the same guidance as create.
     return _dumps(_with_guidance(
-        {"success": True, "job": _format_job(updated)}, updated, _normalize_deliver_param(a["deliver"])))
+        _job_state_payload(updated), updated, _normalize_deliver_param(a["deliver"])))
 
 
 _JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
 _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
-    "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"])),
-    "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
+    "pause": lambda job, a: _dumps(_job_state_payload(pause_job(job["id"], reason=a["reason"]))),
+    "resume": lambda job, a: _dumps(_job_state_payload(resume_job(job["id"]))),
 }
 
 
