@@ -360,14 +360,14 @@ def _replay_pending(conn, rows, target_queue, now: float) -> int:
 
 
 def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> int:
-    """Offer this home's completions whose owner died after THIS process started (#97202).
+    """Re-offer this home's completions after owner loss or a released delivery attempt.
 
     Startup replay (``restore_undelivered_completions``) covers owners that died before the process
     started; this covers the rest while it runs. Abandoned in-flight rows are first classified by
     ``recover_abandoned_delegations``. A terminal row qualifies when it is pending with an event, idle
     past ``_ORPHAN_STALE_S``, not under a live delivery claim, and its owner fails the shared liveness
-    check. A row is offered once per live in-memory copy: a consumer that discards the copy with the row
-    still pending hands it back for the next sweep. The consumer's ``claim_completion_delivery`` stays
+    check, unless a prior delivery attempt explicitly released its claim. A row is offered once per live
+    in-memory copy: a consumer that discards the copy with the row still pending hands it back for the next sweep. The consumer's ``claim_completion_delivery`` stays
     the atomic cross-process gate, so two processes offering one row never both deliver it. Rows past
     the delivery budget or the replay age converge to ``dropped``. Reads the current profile's ledger:
     callers bind the owning profile first."""
@@ -381,15 +381,16 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
         offered = {delegation_id for key, delegation_id in _offered if key == home}
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at,
-                      owner_pid, owner_started_at, delivery_attempts
+                      owner_pid, owner_started_at, delivery_attempts,
+                      delivery_claim IS NULL AND delivery_attempts > 0 AS released_attempt
                FROM async_delegations
                WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
                  AND event_json IS NOT NULL AND updated_at < ?
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
                ORDER BY completed_at, delegation_id""", (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S)).fetchall()
         orphans = []
-        for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts in rows:
-            if delegation_id in offered or alive(pid, started):
+        for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts, released in rows:
+            if delegation_id in offered or (not released and alive(pid, started)):
                 continue
             if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
                 # Its last claimant died holding the final attempt; converge like release_completion_delivery.

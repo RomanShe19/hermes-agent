@@ -12,6 +12,7 @@ from __future__ import annotations
 import queue
 import sqlite3
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -190,9 +191,17 @@ def test_refused_prompt_keeps_durable_delegation_pending_until_accepted(monkeypa
         row = ledger.get_durable_delegation(event["delegation_id"])
         assert row["delivery_state"] == "pending"
         assert row["result"] == {"status": "completed"}
+        pending = queue.Queue()
+        now = time.time()
+        assert ledger.sweep_orphaned_completions(pending, now=now) == 0
+        retry_at = now + ledger._ORPHAN_STALE_S + 1
+        assert ledger.sweep_orphaned_completions(pending, now=retry_at) == 1
+        assert ledger.sweep_orphaned_completions(pending, now=retry_at + 1) == 0
+        replay = pending.get_nowait()
+        assert replay["delegation_id"] == event["delegation_id"]
         assert server._notif_claim_turn(session) is True
 
-        assert server._notif_dispatch_event("sid", session, event, "result") is True
+        assert server._notif_dispatch_event("sid", session, replay, "result") is True
         assert ledger.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
         assert ledger.claim_event_delivery(event, "duplicate-check") is None
         assert submitted == ["result", "result"]
