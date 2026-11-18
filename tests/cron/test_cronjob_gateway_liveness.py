@@ -289,3 +289,46 @@ class TestRuntimeLockFirstLiveness:
             ),
         ):
             assert cron_cli._builtin_gateway_liveness() is True
+
+
+@pytest.mark.parametrize("action", ["resume", "update"])
+@pytest.mark.parametrize(
+    "provider,pids,expected",
+    [
+        ("builtin", [], False),
+        ("builtin", [12345], True),
+        ("chronos", [], True),
+        (None, [], None),
+    ],
+)
+def test_enabled_job_changes_surface_liveness(hermes_env, action, provider, pids, expected):
+    from tools.cronjob_tools import cronjob
+
+    job_id = _create_job()["job_id"]
+    if action == "resume":
+        cronjob(action="pause", job_id=job_id)
+    updates = {"schedule": "every 20m"} if action == "update" else {}
+    with patch_liveness(provider=provider, pids=pids):
+        result = json.loads(cronjob(action=action, job_id=job_id, **updates))
+
+    assert result["success"] is True
+    assert result["job"]["enabled"] is True
+    assert result["gateway_running"] is expected
+    if expected is False:
+        assert "will not fire" in result["warning"].lower()
+    else:
+        assert "warning" not in result
+
+
+def test_paused_job_changes_stay_quiet_without_gateway(hermes_env):
+    from tools.cronjob_tools import cronjob
+
+    job_id = _create_job()["job_id"]
+    with patch_liveness(provider="builtin", pids=[]):
+        paused = json.loads(cronjob(action="pause", job_id=job_id))
+        updated = json.loads(cronjob(action="update", job_id=job_id, name="renamed"))
+
+    for result in (paused, updated):
+        assert result["success"] is True
+        assert result["job"]["enabled"] is False
+        assert "warning" not in result

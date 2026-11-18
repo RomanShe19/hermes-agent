@@ -740,9 +740,12 @@ def _action_remove(job: dict[str, Any], a: dict[str, Any]) -> str:
     })
 
 
-def _job_state_result(updated: dict[str, Any]) -> str:
+def _job_state_payload(updated: dict[str, Any]) -> dict[str, Any]:
     _notify_provider_jobs_changed_safe()
-    return _dumps({"success": True, "job": _format_job(updated)})
+    result = {"success": True, "job": _format_job(updated)}
+    if updated.get("enabled", True):
+        result.update(_gateway_liveness_notice())
+    return result
 
 
 def _refreshed_job_view(job_id: str) -> dict[str, Any]:
@@ -948,18 +951,17 @@ def _action_update(job: dict[str, Any], a: dict[str, Any]) -> str:
     if not updates:
         return tool_error("No updates provided.", success=False)
     updated = update_job(job["id"], updates)
-    _notify_provider_jobs_changed_safe()
     # An update can switch modes or delivery — echo the same guidance as create.
     return _dumps(_with_guidance(
-        {"success": True, "job": _format_job(updated)}, updated, _normalize_deliver_param(a["deliver"])))
+        _job_state_payload(updated), updated, _normalize_deliver_param(a["deliver"])))
 
 
 _JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
 _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
-    "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"])),
-    "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
+    "pause": lambda job, a: _dumps(_job_state_payload(pause_job(job["id"], reason=a["reason"]))),
+    "resume": lambda job, a: _dumps(_job_state_payload(resume_job(job["id"]))),
 }
 
 
