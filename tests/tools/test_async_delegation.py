@@ -1223,14 +1223,17 @@ def test_prune_never_evicts_live_records():
     assert "done-0" not in survivors and len(survivors - {"live-stalling", "live-finalizing", "live-running"}) == ad._MAX_RETAINED_COMPLETED
 
 
-def test_stalled_group_preserves_child_results_in_delivery_and_history(monkeypatch):
+@pytest.mark.parametrize("terminal_status", ["stalled", "error"])
+def test_failed_group_preserves_child_results_in_delivery_and_history(monkeypatch, terminal_status):
     _fast_stale_monitor(monkeypatch)
-    delegation_id = "deleg_stalled_group"
+    delegation_id = "deleg_failed_group"
     release = threading.Event()
     finished = {"task_index": 1, "status": "completed", "summary": "verified backup"}
 
     def runner():
         ad.record_unit_child(delegation_id, finished)
+        if terminal_status == "error":
+            raise RuntimeError("failed to finish the delegation group")
         release.wait(timeout=10)
         return {"results": [finished]}
 
@@ -1243,7 +1246,7 @@ def test_stalled_group_preserves_child_results_in_delivery_and_history(monkeypat
     try:
         assert handle["status"] == "dispatched"
         event = _drain_for(delegation_id)
-        assert event is not None and event["status"] == "stalled"
+        assert event is not None and event["status"] == terminal_status
         finished_result, unfinished_result = event["results"]
         assert finished_result == finished
         assert (unfinished_result["task_index"], unfinished_result["status"]) == (3, "unknown")

@@ -206,9 +206,9 @@ def _prune_durable_records() -> None:
 def _persist_completion(event: dict[str, Any], result: dict[str, Any]) -> None:
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
-        # The stall monitor has no joined result. Merge saved children under the same
-        # lock as record_unit_child so the queued event and durable row agree.
-        if event.get("status") == "stalled" and event.get("is_batch") and not event.get("results"):
+        # A forced stall or runner crash has no joined result. Merge saved children
+        # under the same lock as record_unit_child so the event and durable row agree.
+        if event.get("status") in {"stalled", "error"} and event.get("is_batch") and not event.get("results"):
             row = conn.execute(
                 "SELECT task_json, result_json FROM async_delegations WHERE delegation_id=?",
                 (event["delegation_id"],),
