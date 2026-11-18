@@ -167,3 +167,24 @@ def test_apiserver_session_without_id_stays_synchronous(monkeypatch):
     assert parsed.get("status") != "dispatched", parsed
     assert "SYNCHRONOUSLY" in parsed.get("note", "")
     assert process_registry.completion_queue.empty()
+
+
+def test_scheduler_submission_failure_is_not_reported_as_capacity(monkeypatch):
+    from tools import async_delegation
+
+    dt = _patch_delegate(monkeypatch)
+    set_session_vars(
+        platform="api_server", chat_id="scheduler-probe", session_key="scheduler-probe",
+        session_id="scheduler-probe", session_history_delivery="1", async_delivery=False,
+    )
+    executor = MagicMock()
+    executor.submit.side_effect = RuntimeError("executor refused submission")
+    monkeypatch.setattr(async_delegation, "_get_executor", lambda _workers: executor)
+
+    parsed = json.loads(dt.delegate_task(goal="verify results", background=True, parent_agent=_fake_parent()))
+
+    assert executor.submit.call_count == 1
+    assert parsed["results"][0]["summary"] == "done: verify results"
+    assert "could not schedule" in parsed["note"].lower()
+    assert "at capacity" not in parsed["note"].lower()
+    assert process_registry.completion_queue.empty()

@@ -235,6 +235,14 @@ _SYNC_FALLBACK_NOTES = {
         "SYNCHRONOUSLY and the result is included above. Raise "
         "delegation.max_concurrent_children in config.yaml to allow more concurrent background delegations."
     ),
+    "scheduler_failed": (
+        "Hermes could not schedule the background delegation. The subagent(s) ran SYNCHRONOUSLY "
+        "and the result is included above."
+    ),
+    "dispatch_rejected": (
+        "Hermes did not accept the background delegation. The subagent(s) ran SYNCHRONOUSLY "
+        "and the result is included above."
+    ),
 }
 
 def _run_sync_with_note(batch: _Batch, reason: str) -> str:
@@ -456,11 +464,14 @@ def _dispatch_background(batch: _Batch) -> str:
             continue
         _restore_parent_cancellation(unit)
         if not dispatched:
+            reason = dispatch.get("reason")
+            if reason not in {"at_capacity", "scheduler_failed"}:
+                reason = "dispatch_rejected"
             logger.info(
-                "delegate_task: async pool at capacity (%s); running the whole batch synchronously instead.",
+                "delegate_task: background dispatch rejected (%s); running the whole batch synchronously instead.",
                 dispatch.get("error", "rejected"),
             )
-            return _run_sync_with_note(batch, "at_capacity")
+            return _run_sync_with_note(batch, reason)
         # Later units of an admitted call share its slot and cannot be capacity-rejected; a scheduler failure runs
         # the unit inline so no task is silently dropped.
         logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.", k + 1, len(units), dispatch.get("error"))
