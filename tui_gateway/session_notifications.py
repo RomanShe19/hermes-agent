@@ -489,7 +489,7 @@ def _background_notifications_off(session: dict) -> bool:
     return raw is False or str(raw or "").strip().lower() == "off"
 
 
-def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None:
+def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool:
     """Run the claimed (running=True) agent turn for one notification event."""
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
     try:
@@ -502,7 +502,7 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         # the target. No turn will run, and nothing else clears ``running``: a busy session is exempt
         # from the reaper, keeps its lease, and never reaches its bot mailbox again.
         _notif_release_turn(session)
-        return
+        return False
     evt_type = evt.get("type")
     kwargs: dict = {}
     if evt_type == "async_delegation":
@@ -520,8 +520,18 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
     except Exception:
         release_event_delivery(evt, claim)
-        return
+        return False
     complete_event_delivery(evt, claim)
+    return True
+
+
+def _notif_heartbeat_obsolete(evt: dict, emitted: set, registry) -> bool:
+    """Busy turns can defer a running snapshot until after that process has exited."""
+    if evt.get("type") != "heartbeat":
+        return False
+    process = registry.get(evt.get("session_id", ""))
+    delivered = ("delivered", *_notification_event_dedup_key(evt))
+    return process is None or process.exited or delivered in emitted
 
 
 def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, completions=None, *, owned=False) -> bool:
@@ -556,6 +566,8 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         else:
             logger.debug("Dropping unowned %s notification during shutdown drain (origin=%r key=%r)", evt_type, origin, key)
         return True
+    if _notif_heartbeat_obsolete(evt, emitted, registry):
+        return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
         return True
     text = fmt(evt)
@@ -586,7 +598,12 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             return False
         time.sleep(0.25)  # back off: the re-queued event keeps the queue non-empty, else this loop spins at 100% CPU
         return True
-    _notif_dispatch_event(sid, session, evt, text)
+    # Recheck after claiming: the process can finish while the turn was busy.
+    if _notif_heartbeat_obsolete(evt, emitted, registry):
+        _notif_release_turn(session)
+        return True
+    if _notif_dispatch_event(sid, session, evt, text) and evt_type == "heartbeat":
+        emitted.add(("delivered", *dedup_key))
     return True
 
 
