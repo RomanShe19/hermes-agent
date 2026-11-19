@@ -110,6 +110,24 @@ def test_accepted_and_finished_records_on_success(turn_env, caplog):
     assert "hunter2" not in fin
 
 
+@pytest.mark.parametrize("closing", [False, True])
+def test_goal_followup_emits_start_only_for_an_admitted_turn(turn_env, monkeypatch, closing):
+    events = []
+    monkeypatch.setattr(server, "_emit", lambda kind, *a, **kw: events.append(kind))
+    agent = types.SimpleNamespace(
+        session_id="goal-agent",
+        run_conversation=lambda *a, **k: {"final_response": "done"},
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True, _closing=closing)
+
+    server._dispatch_followup_turn("rid", "goal-ui", session, "keep going", "goal continuation dispatch")
+
+    assert events.count("message.start") == (0 if closing else 1)
+    assert events.count("message.complete") == (0 if closing else 1)
+    assert session["running"] is False
+
+
 @pytest.mark.parametrize("settle_info_raises", [False, True])
 def test_turn_settles_before_post_turn_trim(turn_stubs, monkeypatch, caplog, settle_info_raises):
     """A blocked post-turn trim must not hold the session running or its bookend (#131740);

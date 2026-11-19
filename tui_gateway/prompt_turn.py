@@ -418,18 +418,11 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
             logger.warning("voice TTS dispatch failed: %s", e)
 
 
-def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str, *,
-                            on_done=None, on_error=None) -> None:
-    """Chain one follow-up turn (caller set ``running``); on failure run ``on_error``, log,
-    release ``running``."""
+def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str) -> None:
+    """Submit a reserved follow-up turn and release the reservation if dispatch raises."""
     try:
-        _emit("message.start", sid)
         _run_prompt_submit(rid, sid, session, prompt)
-        if on_done is not None:
-            on_done()
     except Exception as exc:
-        if on_error is not None:
-            on_error()
         _hook_failure(what, exc)
         with session["history_lock"]:
             session["running"] = False
