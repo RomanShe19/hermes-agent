@@ -123,10 +123,12 @@ def test_orphaned_terminal_completion_is_offered_once_while_the_process_runs(tmp
     assert _row(home, delegation_id)["delivery_state"] == "delivered"
 
 
-def test_row_owned_by_a_live_process_is_never_swept(tmp_path):
+def test_row_owned_by_a_live_process_is_never_swept(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     q = queue.Queue()
+    live_queue = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", live_queue)
     with _Home(home):
         handle = ad.dispatch_async_delegation(
             goal="mine", context=None, toolsets=None, role="leaf", model="m", session_key="live",
@@ -138,6 +140,7 @@ def test_row_owned_by_a_live_process_is_never_swept(tmp_path):
         assert row["owner_pid"] == os.getpid() and row["delivery_state"] == "pending"
         assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + 3600) == 0
     assert q.empty()
+    assert [event["delegation_id"] for event in _drain(live_queue)] == [handle["delegation_id"]]
 
 
 def test_sweep_is_bound_to_the_profile_home_it_runs_under(tmp_path):
