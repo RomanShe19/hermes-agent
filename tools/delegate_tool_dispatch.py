@@ -40,7 +40,7 @@ class _Batch:
     max_children: int
     live_deleg_id: Optional[str]
     live_writers: list
-    live_paths: list
+    live_paths: list[str | None]
     origin_wake_sid: str
     origin_ui_session_id: str
     origin_owner_transport: Any
@@ -202,8 +202,8 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
         if isinstance(_idx, int) and 0 <= _idx < len(batch.live_writers) and batch.live_writers[_idx] is not None:
             with _quiet("Live transcript finalize failed", exc_info=True):
                 batch.live_writers[_idx].finalize(entry)
-            if _idx < len(batch.live_paths):
-                entry["live_transcript"] = batch.live_paths[_idx]
+            if _idx < len(batch.live_paths) and (path := batch.live_paths[_idx]):
+                entry["live_transcript"] = path
     update_manifest_statuses(batch.live_deleg_id, results, home=batch.live_home)
     finish_delegation_unit(batch.task_list, results, background=not honor_parent_interrupt)
 
@@ -213,7 +213,7 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     process_notes = [line for entry in results for line in _process_accounting_lines(entry)]
     if process_notes:
         combined["process_notes"] = process_notes
-    unit_paths = [batch.live_paths[i] for (i, _, _) in batch.children if i < len(batch.live_paths)]
+    unit_paths = [path for i, _, _ in batch.children if i < len(batch.live_paths) and (path := batch.live_paths[i])]
     if unit_paths:
         combined["live_transcripts"] = unit_paths
     if batch.group is not None:
@@ -371,9 +371,15 @@ def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]]) -> dict:
     if any(isinstance(s, str) and s for s in sids):
         payload["subagent_ids"] = sids
         payload["control_hint"] = _BACKGROUND_NOTES["control_hint"]
-    if batch.live_paths:
-        payload["live_transcripts"] = list(batch.live_paths)
+    paths = [path for path in batch.live_paths if path]
+    if paths:
+        payload["live_transcripts"] = paths
         payload["live_transcripts_hint"] = _BACKGROUND_NOTES["live_transcripts_hint"]
+        if len(paths) < len(goals):
+            payload["task_transcripts"] = {str(index): path for index, path in enumerate(batch.live_paths) if path}
+            payload["live_transcripts_hint"] = (
+                "Some task logs are unavailable. task_transcripts maps zero-based task indexes to available paths."
+            )
     return payload
 
 def _units_of(batch: _Batch) -> list[_Batch]:
@@ -410,10 +416,9 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
         interrupt_fn=_interrupt, delegation_id=unit_id, slot_key=slot_key,
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
-        # Persist locators before starting workers; live_paths omits failed writers and can be compressed.
-        task_transcripts={str(i): str(unit.live_writers[i].path) for i, _, _ in unit.children
-                          if i < len(unit.live_writers) and unit.live_writers[i] is not None
-                          and unit.live_writers[i].path is not None},
+        # Persist each indexed locator before its worker starts.
+        task_transcripts={str(i): path for i, _, _ in unit.children
+                          if i < len(unit.live_paths) and (path := unit.live_paths[i])},
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
     )
 

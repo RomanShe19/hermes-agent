@@ -237,9 +237,9 @@ def create_live_transcripts(
     delegation_id: Optional[str] = None, model: Optional[str] = None,
     provider: Optional[str] = None,
     home: Optional[Path] = None,
-) -> tuple[Optional[str], list[Optional[LiveTranscriptWriter]], list[str]]:
+) -> tuple[Optional[str], list[Optional[LiveTranscriptWriter]], list[Optional[str]]]:
     """One pre-headered writer per task + a manifest.json; prunes stale dirs.
-    Returns ``(delegation_id, writers, paths)``; on any top-level failure
+    Writer and path positions both match task indexes. On any top-level failure:
     ``(None, [None]*n, [])`` so delegation proceeds untouched.
 
     ``home`` pins every transcript and the manifest to one explicit profile
@@ -257,8 +257,8 @@ def create_live_transcripts(
                                      context=t.get("context") or context, root=root)
                 for i, t in enumerate(task_list)]
         writers: list[Optional[LiveTranscriptWriter]] = [w if w.path is not None else None for w in made]
-        paths: list[str] = [str(w.path) for w in made if w.path is not None]
-        if not paths:
+        paths = [str(w.path) if w.path is not None else None for w in made]
+        if not any(paths):
             return None, [None] * n, []
         _write_manifest(deleg_id, task_list, paths, model=model, provider=provider, home=home)
         return deleg_id, writers, paths
@@ -270,7 +270,7 @@ def _manifest_path(delegation_id: str, home: Optional[Path] = None) -> Path:
 
 
 def _write_manifest(delegation_id: str, task_list: list[dict[str, Any]],
-                    paths: list[str], model: Optional[str] = None,
+                    paths: list[Optional[str]], model: Optional[str] = None,
                     provider: Optional[str] = None, home: Optional[Path] = None) -> None:
     with _best_effort("manifest write"):
         _dump_json(_manifest_path(delegation_id, home), {

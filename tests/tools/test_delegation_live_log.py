@@ -525,3 +525,45 @@ def test_concurrent_units_do_not_overwrite_manifest_statuses(monkeypatch):
     assert not first.is_alive() and not second.is_alive()
     manifest = json.loads((Path(paths[0]).parent / "manifest.json").read_text(encoding="utf-8"))
     assert [task["status"] for task in manifest["tasks"]] == ["completed", "completed"]
+
+
+def test_missing_transcript_keeps_existing_log_with_its_task(monkeypatch):
+    from tools import delegate_tool as dt
+    from tools.delegate_tool_dispatch import _dispatched_payload
+
+    batches = []
+    run_batch = dt._run_batch
+
+    def capture(batch, background):
+        batches.append(batch)
+        return run_batch(batch, background)
+
+    monkeypatch.setattr(dt, "_run_batch", capture)
+
+    write = Path.write_text
+
+    def fail_first_log(path, *args, **kwargs):
+        if path.name == "task-0.log":
+            raise OSError("test: first transcript unavailable")
+        return write(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_first_log)
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kwargs: MagicMock())
+    monkeypatch.setattr(dt, "_run_single_child", _fake_run)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *args: _CREDS)
+    result = json.loads(dt.delegate_task(
+        tasks=[{"goal": "Check first input"}, {"goal": "Check second input"}], parent_agent=_make_parent(), background=False,
+    ))
+
+    assert "results" in result, result
+    [second_path] = result["live_transcripts"]
+    assert Path(second_path).name == "task-1.log"
+    assert "live_transcript" not in result["results"][0]
+    assert result["results"][1]["live_transcript"] == second_path
+    manifest = json.loads((Path(second_path).parent / "manifest.json").read_text(encoding="utf-8"))
+    assert [task["log"] for task in manifest["tasks"]] == [None, second_path]
+
+    [batch] = batches
+    payload = _dispatched_payload(batch, [(batch, batch.live_deleg_id)])
+    assert payload["live_transcripts"] == [second_path]
+    assert payload["task_transcripts"] == {"1": second_path}
