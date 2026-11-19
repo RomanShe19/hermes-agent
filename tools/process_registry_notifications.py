@@ -146,11 +146,21 @@ _TRUNCATED_SUMMARY_NOTE = (
     "the unfinished part.]")
 
 
-DELEGATION_ITERATION_LIMIT_NOTE = "Iteration limit reached. Verify the partial result before continuing."
+_DELEGATION_ITERATION_LIMIT_NOTE = "Iteration limit reached. Verify the partial result before continuing."
+_DELEGATION_SCHEMA_NOTE = "Output schema validation failed. The raw result is available for review."
 
 
 def is_delegation_truncated(entry: dict) -> bool:
     return bool(entry.get("truncated") or entry.get("exit_reason") == "max_iterations")
+
+
+def delegation_completion_warning(entry: dict) -> str:
+    warnings = []
+    if is_delegation_truncated(entry):
+        warnings.append(_DELEGATION_ITERATION_LIMIT_NOTE)
+    if entry.get("schema_valid") is False:
+        warnings.append(_DELEGATION_SCHEMA_NOTE)
+    return " ".join(warnings)
 
 
 def _notice_lines(results) -> list[str]:
@@ -239,12 +249,19 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         idx, r_truncated = r.get("task_index", 0), is_delegation_truncated(r)
         r_status, r_summary, r_error = r.get("status", "?"), r.get("summary"), r.get("error")
         r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
-        icon = "⚠" if r_truncated else ("✓" if r_status in _DONE else "✗")
+        schema_invalid = r.get("schema_valid") is False
+        icon = "⚠" if r_truncated or (r_status in _DONE and schema_invalid) else ("✓" if r_status in _DONE else "✗")
         header = (f"--- {icon} TASK {idx + 1}/{n}" + (f": {r_goal}" if r_goal else "") + f"  (status={r_status}"
                   + (f", api_calls={r['api_calls']}" if r.get("api_calls") else "")
                   + (f", {r['duration_seconds']}s" if r.get("duration_seconds") is not None else "")
-                  + (", TRUNCATED: hit max_iterations — work may be incomplete" if r_truncated else ""))
+                  + (", TRUNCATED: hit max_iterations — work may be incomplete" if r_truncated else "")
+                  + (", SCHEMA VALIDATION FAILED" if schema_invalid else ""))
         lines += ["", header + ") ---"]
+        if schema_invalid:
+            lines.append(r.get("schema_note") or _DELEGATION_SCHEMA_NOTE)
+            errors = r.get("schema_errors")
+            if isinstance(errors, list):
+                lines.extend(f"Schema error: {error}" for error in errors[:5])
         if r_status in _DONE and r_summary:
             if r_truncated:
                 lines.append(_TRUNCATED_SUMMARY_NOTE)
@@ -331,7 +348,7 @@ def async_delegation_display_text(evt: dict) -> str:
                      "unknown": "Unknown", "rejected": "Failed"}
     for result in results:
         status = result.get("status") or ("failed" if result.get("error") else "completed")
-        label = ("Incomplete" if is_delegation_truncated(result) else "Completed") if status in _DONE else (
+        label = ("Incomplete" if delegation_completion_warning(result) else "Completed") if status in _DONE else (
             status_labels.get(status, "Incomplete"))
         labels.append(label)
         index = result.get("task_index", 0)

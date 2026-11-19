@@ -237,6 +237,7 @@ class TestRunSingleChildSchemaValidation:
         prose = 'Findings:\n```json\n{"town": "Oslo"}\n```\nlet me know.'
         child = _StubChild([prose, prose])
         child._delegate_output_schema = ADDRESS_SCHEMA
+        child.tool_progress_callback = MagicMock()
         entry = _run(child)
         assert entry["status"] == "completed"
         assert entry["summary"] == prose
@@ -245,6 +246,23 @@ class TestRunSingleChildSchemaValidation:
         assert "UNVALIDATED" in entry["schema_note"]
         assert "error" not in entry
         assert len(child.calls) == 2  # exactly one bounded retry
+        [completion] = [
+            call.kwargs for call in child.tool_progress_callback.call_args_list
+            if call.args and call.args[0] == "subagent.complete"
+        ]
+        assert completion["status"] == "failed"
+        assert "schema" in completion["summary"].lower()
+        assert prose in completion["summary"]
+
+        from tools.process_registry_notifications import async_delegation_display_text, format_process_notification
+
+        event = {"type": "async_delegation", "is_batch": True, "status": "completed",
+                 "goals": ["produce the address"], "results": [entry]}
+        assert async_delegation_display_text(event) == "Subagent Task Incomplete: produce the address"
+        text = format_process_notification(event)
+        assert "SCHEMA VALIDATION FAILED" in text
+        assert prose in text
+        assert entry["schema_errors"][0] in text
 
     def test_prose_wrapped_array_answer_validates(self):
         """A fenced JSON array with prose around it is the answer, not a violation: the extractor

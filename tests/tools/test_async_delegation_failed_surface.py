@@ -100,3 +100,14 @@ def test_iteration_limit_remains_visible_after_reconnect():
     [row] = ad.failed_delegations_for_session("ui-reminted", "agent-1")
     assert (row["task_index"], row["goal"], row["status"]) == (1, "verify", "failed")
     assert "iteration limit" in row["error"].lower()
+
+
+def test_unvalidated_output_remains_visible_after_reconnect():
+    _delegation(
+        "d-schema", status="completed", goal="verify results", is_batch=True, goals=["verify results"],
+        result={"results": [{"task_index": 0, "status": "completed", "schema_valid": False,
+                             "summary": "unvalidated result"}]},
+    )
+    [row] = ad.failed_delegations_for_session("ui-reminted", "agent-1")
+    assert (row["task_index"], row["goal"], row["status"]) == (0, "verify results", "failed")
+    assert "schema" in row["error"].lower()

@@ -21,7 +21,7 @@ from tools.delegate_tool_progress import (
 )
 from tools.delegate_tool_registry import _capture_gateway_steer_authority
 from tools.delegate_tool_results import _finalize_child_results
-from tools.process_registry_notifications import DELEGATION_ITERATION_LIMIT_NOTE, is_delegation_truncated
+from tools.process_registry_notifications import delegation_completion_warning
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -94,17 +94,14 @@ def _report_child_done(parent_agent, spinner_ref, entry, tag, task_labels, n_tas
     label = task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
     status = entry.get("status", "?")
     _slot = f"{tag} · {idx+1}/{n_tasks}" if tag else f"{idx+1}/{n_tasks}"
-    schema_invalid = entry.get("schema_valid") is False and status == "completed"
-    truncated = status == "completed" and is_delegation_truncated(entry)
-    icon = "⚠" if truncated or schema_invalid else ("✓" if status == "completed" else "✗")
+    warning = delegation_completion_warning(entry) if status == "completed" else ""
+    icon = "⚠" if warning else ("✓" if status == "completed" else "✗")
     completion_line = f"{icon} [{_slot}] {label}  ({entry.get('duration_seconds', 0)}s)"
     _err_line = (
         describe_subagent_failure(entry.get("failure_reason"), entry.get("error"), max_chars=120)
         if status in SUBAGENT_FAILURE_STATUSES else "")
-    if schema_invalid:
-        _err_line = "output_schema not satisfied — raw text returned (schema_valid=false)"
-    if truncated:
-        _err_line = " ".join(filter(None, (DELEGATION_ITERATION_LIMIT_NOTE, _err_line)))
+    if warning:
+        _err_line = warning
     if _err_line:
         completion_line += f" — {_err_line}"
     _print_completion_line(parent_agent, spinner_ref, completion_line)
