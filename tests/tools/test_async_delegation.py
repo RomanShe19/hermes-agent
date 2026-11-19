@@ -1320,3 +1320,31 @@ def test_failed_dispatch_releases_slot_for_next_worker(monkeypatch, start_step):
     event = _drain_for(next_handle["delegation_id"])
     assert event and event["status"] == "completed"
     assert runs == ["started"]
+
+
+def test_monitor_start_failure_does_not_hide_running_worker(monkeypatch, caplog):
+    release = threading.Event()
+    runs = []
+
+    def runner():
+        runs.append("started")
+        assert release.wait(8)
+        return {"status": "completed", "summary": "verified"}
+
+    def monitor_unavailable():
+        raise RuntimeError("cannot start monitor thread")
+
+    monkeypatch.setattr(ad, "_ensure_stale_monitor", monitor_unavailable)
+    try:
+        handle = ad.dispatch_async_delegation(
+            goal="verify once", context=None, toolsets=None, role="leaf", model=None,
+            session_key="owner", runner=runner, progress_fn=lambda: ((0, None), False),
+        )
+        assert handle["status"] == "dispatched"
+        assert "Could not start the async delegation monitor" in caplog.text
+    finally:
+        release.set()
+
+    event = _drain_for(handle["delegation_id"])
+    assert event and event["status"] == "completed" and event["summary"] == "verified"
+    assert runs == ["started"]

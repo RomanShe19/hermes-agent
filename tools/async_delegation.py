@@ -875,7 +875,12 @@ def _dispatch_admitted(
                 "error": f"Failed to schedule async delegation{label}: {exc}"}
     future.add_done_callback(lambda _: retirement.release())
     if progress_fn is not None:
-        _ensure_stale_monitor()
+        try:
+            _ensure_stale_monitor()
+        except Exception:
+            # This worker already owns the task. Preserve its handle so the caller can
+            # track it and receive the completion even without the stall monitor.
+            logger.warning("Could not start the async delegation monitor for %s", delegation_id, exc_info=True)
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
