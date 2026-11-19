@@ -455,6 +455,21 @@ class TestCronRunBackgroundDispatch:
         assert "failed" not in out.lower()
         assert "Ran now" not in out
 
+    def test_background_admission_is_reported_before_execution(self, monkeypatch, capsys):
+        monkeypatch.setattr(cron_cli, "_cron_api", lambda **kwargs: {
+            "success": True,
+            "job": {
+                "id": "job-1", "name": "Watchdog", "executed": False,
+                "execution_mode": "background", "execution_state": "accepted", "delegation_id": "del-1",
+            },
+        })
+
+        rc, out = self._run_cmd(capsys)
+
+        assert rc == 0
+        assert "Accepted for background execution (delegation del-1)." in out
+        assert "Ran now" not in out
+
     def test_background_dispatch_without_delegation_id(self, monkeypatch, capsys):
         monkeypatch.setattr(
             cron_cli,

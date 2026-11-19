@@ -10,7 +10,7 @@ conversation as a type='async_delegation' completion event.
 Sync fallbacks preserved:
   - no routable session (direct Python callers, `hermes cron run`)
   - async delivery unsupported (one-shot runners, cron child sessions)
-  - dispatch pool at capacity (claim already taken — must not strand it)
+Capacity refusals leave the cron schedule unchanged.
 """
 import json
 import threading
@@ -53,7 +53,7 @@ def _bound_session_key(key="agent:main:telegram:dm:123"):
 
 class TestBackgroundDispatch:
     def test_dispatches_and_returns_handle_immediately(self):
-        """With a routable session, run claims sync then dispatches async."""
+        """With a routable session, dispatch reserves capacity before claiming the job."""
         run_started = threading.Event()
         run_release = threading.Event()
 
@@ -69,16 +69,12 @@ class TestBackgroundDispatch:
                        return_value={"last_status": "ok", "last_error": None}):
                 res = _try_dispatch_background_run(_job('job-bg-01'))
 
-        try:
-            # Returned BEFORE the job finished — that's the whole point.
-            assert res is not None
-            assert res["claimed"] is True
-            assert res["dispatched"] is True
-            assert res["delegation_id"]
-            # The job actually starts on the daemon executor.
-            assert run_started.wait(timeout=5.0), "job never started in background"
-        finally:
-            run_release.set()
+                try:
+                    assert res["dispatched"] is True
+                    assert res["delegation_id"]
+                    assert run_started.wait(timeout=5.0), "job never started in background"
+                finally:
+                    run_release.set()
 
     def test_completion_event_reaches_shared_queue(self):
         """The finished run pushes a type='async_delegation' event carrying
@@ -146,18 +142,38 @@ class TestBackgroundDispatch:
         assert found["status"] == "error"
         assert "provider exploded" in (found.get("error") or "")
 
-    def test_claim_lost_reports_immediately_without_dispatch(self):
-        """Paused/already-firing jobs report in the tool response, not as a
-        delayed completion event."""
+    def test_known_paused_job_reports_immediately_without_dispatch(self):
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
-                 patch("tools.cronjob_tools.get_job",
-                       return_value={**_JOB, "enabled": False}), \
-                 patch("tools.async_delegation.dispatch_async_delegation") as m_disp:
-                res = _try_dispatch_background_run(_job('job-bg-04'))
+            with patch("tools.cronjob_tools.claim_job_for_fire") as claim, \
+                 patch("tools.async_delegation.dispatch_async_delegation") as dispatch:
+                res = _try_dispatch_background_run({**_job("job-bg-04"), "enabled": False})
         assert res["claimed"] is False
         assert "paused/disabled" in res["error"]
-        m_disp.assert_not_called()
+        claim.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_claim_lost_after_admission_reports_without_reusing_previous_output(self):
+        runners = []
+
+        def dispatch(**kwargs):
+            runners.append(kwargs["runner"])
+            return {"status": "dispatched", "delegation_id": "accepted"}
+
+        with _bound_session_key():
+            with patch("tools.async_delegation.dispatch_async_delegation", side_effect=dispatch), \
+                 patch("tools.cronjob_tools.claim_job_for_fire", return_value=False) as claim, \
+                 patch("tools.cronjob_tools.get_job", return_value={**_JOB, "enabled": False}), \
+                 patch("tools.cronjob_tools._latest_job_output_excerpt") as excerpt:
+                res = _try_dispatch_background_run(_job("job-race"))
+                assert res["dispatched"] is True
+                claim.assert_not_called()
+                [run] = runners
+                completion = run()
+
+        assert completion["status"] == "error"
+        assert completion["summary"] is None
+        assert "paused/disabled" in completion["error"]
+        excerpt.assert_not_called()
 
 class TestSyncFallbacks:
     def test_no_session_key_falls_back_to_sync(self):
@@ -173,19 +189,27 @@ class TestSyncFallbacks:
                 res = _try_dispatch_background_run(_job('job-bg-06'))
         assert res is None
 
-    def test_pool_at_capacity_runs_inline(self):
-        """A rejected dispatch must not strand the already-taken claim."""
+    def test_pool_at_capacity_preserves_schedule_and_does_not_run(self, tmp_path, monkeypatch):
+        from cron.jobs import create_job, get_job
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        job = create_job("do the work", "0 9 * * *", name="capacity test")
+        before = get_job(job["id"])
+
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
-                 patch("tools.async_delegation.dispatch_async_delegation",
-                       return_value={"status": "rejected", "error": "capacity"}), \
-                 patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
-                 patch("tools.cronjob_tools.get_job",
-                       return_value={"last_status": "ok", "last_error": None}):
-                res = _try_dispatch_background_run(_job('job-bg-07'))
-        assert res["dispatched"] is False
-        assert res["success"] is True
-        m_run.assert_called_once()   # ran inline on this thread
+            with patch("tools.async_delegation.dispatch_async_delegation",
+                       return_value={"status": "rejected", "reason": "at_capacity", "error": "capacity"}), \
+                 patch("cron.scheduler.run_one_job", return_value=True) as run_job:
+                result = _try_dispatch_background_run(job)
+
+        assert result["dispatched"] is False
+        assert result["claimed"] is False
+        assert result["reason"] == "at_capacity"
+        run_job.assert_not_called()
+        after = get_job(job["id"])
+        assert after["next_run_at"] == before["next_run_at"]
+        assert after.get("fire_claim") == before.get("fire_claim")
+        assert after.get("repeat") == before.get("repeat")
 
 class TestInFlightDedupe:
     """Manual runs must not double-fire a job that is already mid-run
@@ -282,6 +306,7 @@ class TestCronjobRunToolIntegration:
                 out = json.loads(cronjob(action="run", job_id="job-bg-12"))
 
         assert out["success"] is True
-        assert out["job"]["executed"] is True
+        assert out["job"]["executed"] is False
         assert out["job"]["execution_mode"] == "background"
+        assert out["job"]["execution_state"] == "accepted"
         assert out["job"]["delegation_id"]

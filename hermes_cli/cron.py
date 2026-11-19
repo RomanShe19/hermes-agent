@@ -889,6 +889,10 @@ def _run_outcome(job: dict[str, Any]) -> str:
     A background-dispatched run (execution_mode="background" / delegation_id) keeps running
     after this CLI exits, so report the dispatch rather than a success/failure verdict.
     """
+    if job.get("execution_state") == "accepted":
+        delegation_id = job.get("delegation_id")
+        return (f"Accepted for background execution (delegation {delegation_id})."
+                if delegation_id else "Accepted for background execution.")
     if job.get("delegation_id"):
         return f"Running in background (delegation {job['delegation_id']})."
     if job.get("execution_mode") == "background":

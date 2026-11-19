@@ -528,13 +528,11 @@ def _manual_run_completion(
 def _try_dispatch_background_run(
     job: dict[str, Any], session_id: Optional[str] = None, extra_prompt: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
-    """Claim ``job`` now (SYNCHRONOUSLY, so unrunnable jobs report immediately), then fire it
-    on the async-delegation executor like ``delegate_task``'s background mode: the tool returns
-    a handle and a ``type="async_delegation"`` completion re-enters as a fresh turn (role
-    alternation legal, prompt cache intact) instead of blocking the parent turn for minutes.
-    Returns None when background delivery is unavailable (caller runs sync); ``{"claimed":
-    False}`` on a lost claim; ``{"claimed": True, "dispatched": True, "delegation_id"}``; or
-    ``{"claimed": True, "dispatched": False, ...}`` when the pool was full and it ran inline."""
+    """Submit a manual run whose worker claims the cron job only after background admission.
+
+    Return None when no completion route is available. A refused slot leaves the schedule
+    untouched. If a claim is lost after admission, the worker reports it as a completion.
+    """
     job_id = job["id"]
     job_name = str(job.get("name") or job_id)
     # Reap BEFORE the async/sync branch: the one-shot `hermes cron run` path returns early
@@ -568,11 +566,8 @@ def _try_dispatch_background_run(
     except Exception:
         pass
 
-    claimed_job, err = _claim_for_manual_run(job_id, "background run")
-    if err is not None:
-        if err["claimed"]:
-            err["dispatched"] = False
-        return err
+    if not is_job_runnable(job):
+        return {"claimed": False, "success": False, "error": "Job is paused/disabled; resume it before running."}
 
     origin_ui_session_id = ""
     try:
@@ -587,7 +582,7 @@ def _try_dispatch_background_run(
     except Exception as e:
         logger.warning(
             "cronjob run: async delegation registry unavailable (%s); running job '%s' inline.", e, job_name)
-        result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+        result = _execute_job_now(job, extra_prompt=extra_prompt)
         result["dispatched"] = False
         return result
 
@@ -597,14 +592,20 @@ def _try_dispatch_background_run(
     except Exception:
         max_async = 3
 
-    started_at = time.time()
-    # Scheduler's own normalizer (falsy -> "local", list -> comma string) on the claimed snapshot.
     from cron.scheduler import _normalize_deliver_value
-    deliver = _normalize_deliver_value(claimed_job.get("deliver", "local"))
 
     def _runner() -> dict[str, Any]:
-        res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
-        return _manual_run_completion(res, job_id, job_name, deliver, started_at)
+        started_at = time.time()
+        claimed_job, err = _claim_for_manual_run(job_id, "background run")
+        if err is not None:
+            return {"status": "error", "summary": None, "error": err["error"], "api_calls": 0,
+                    "duration_seconds": round(time.time() - started_at, 2)}
+        deliver = _normalize_deliver_value(claimed_job.get("deliver", "local"))
+        try:
+            res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+            return _manual_run_completion(res, job_id, job_name, deliver, started_at)
+        finally:
+            _notify_provider_jobs_changed_safe()
 
     dispatch = dispatch_async_delegation(
         goal=f"Manual run of cron job '{job_name}' ({job_id})",
@@ -615,13 +616,15 @@ def _try_dispatch_background_run(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         max_async_children=max_async)
     if dispatch.get("status") == "dispatched":
-        return {"claimed": True, "dispatched": True, "delegation_id": dispatch.get("delegation_id")}
+        return {"dispatched": True, "delegation_id": dispatch.get("delegation_id")}
+    if dispatch.get("reason") == "at_capacity":
+        return {"claimed": False, "dispatched": False, "success": False, "reason": "at_capacity",
+                "error": dispatch["error"]}
 
-    # Pool at capacity (or submit failure): the claim is already taken and must not be stranded.
     logger.info(
-        "cronjob run: background pool unavailable (%s); running job '%s' inline.",
+        "cronjob run: background scheduler unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name)
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _execute_job_now(job, extra_prompt=extra_prompt)
     result["dispatched"] = False
     return result
 
@@ -767,20 +770,20 @@ def _action_run(job: dict[str, Any], a: dict[str, Any]) -> str:
     handed_off = _hand_off_primary_routed_run(job, extra_prompt=extra_prompt)
     if handed_off is not None:
         return handed_off
-    # A manual run must actually run even with no ticker active. Preferred: background
-    # dispatch (handle now, outcome as a completion event); inline fallback otherwise.
+    # Prefer background dispatch where a completion can be routed. A capacity refusal has a
+    # terminal response of its own; direct callers without a route retain synchronous execution.
     bg = _try_dispatch_background_run(job, session_id=a["session_id"], extra_prompt=extra_prompt)
     if bg is not None and bg.get("dispatched"):
-        _notify_provider_jobs_changed_safe()
         result = _refreshed_job_view(job_id)
-        result["executed"] = True
+        result["executed"] = False
         result["execution_mode"] = "background"
+        result["execution_state"] = "accepted"
         result["delegation_id"] = bg.get("delegation_id")
         return _dumps({
             "success": True,
             "job": result,
             "note": (
-                "The job is running in the background. You and the "
+                "The job was accepted for background execution. You and the "
                 "user can keep working; its outcome re-enters the "
                 "conversation as a new message when it finishes. "
                 "Do not wait or poll — just continue."),
@@ -803,6 +806,8 @@ def _action_run(job: dict[str, Any], a: dict[str, Any]) -> str:
     result["executed"] = claimed
     result["execution_success"] = exec_result.get("success", False)
     if not claimed:
+        if exec_result.get("reason"):
+            result["execution_reason"] = exec_result["reason"]
         result["execution_skipped"] = exec_result.get("error") or (
             "Already being fired by the scheduler; not run again.")
     elif exec_result.get("error"):
