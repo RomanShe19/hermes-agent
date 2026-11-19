@@ -112,3 +112,57 @@ def test_delegation_completion_reference_is_literal(turn_env, marker_home, monke
 
     assert not references
     assert len(invoked) == 1 and text in invoked[0]
+
+
+@pytest.mark.parametrize("failure_phase", ["before_ack", "after_ack", "model_invoked"])
+def test_only_unprepared_completion_can_replay(turn_env, marker_home, monkeypatch, failure_phase):
+    import queue
+    import time
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import async_delegation as ledger
+
+    frames, scheduled = [], []
+    monkeypatch.setattr(server, "_emit", lambda kind, sid, payload=None: frames.append((kind, payload)))
+    if failure_phase == "model_invoked":
+        def fail_after_start(*args):
+            raise RuntimeError("failure after entering the model path")
+
+        monkeypatch.setattr(server, "_invoke_agent", fail_after_start)
+    else:
+        monkeypatch.setattr(server, "_prepare_turn_input", lambda *args: None)
+    if failure_phase == "after_ack":
+        monkeypatch.setattr(server, "_start_session_work",
+                            lambda target, **kwargs: scheduled.append(target) or object())
+    agent = SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None,
+                            run_conversation=lambda *a, **k: pytest.fail("unprepared input ran"))
+    session = _session(agent=agent, running=True)
+    event = {"type": "async_delegation", "delegation_id": "preflight-replay",
+             "session_key": "session-key", "status": "completed", "dispatched_at": time.time()}
+    original = {"status": "completed", "summary": "retain the durable result"}
+    token = set_hermes_home_override(str(marker_home))
+    try:
+        ledger._persist_dispatch(event)
+        ledger._persist_completion(event, original)
+        assert server._notif_dispatch_event("sid", session, event, "result")
+        if failure_phase == "after_ack":
+            [target] = scheduled
+            assert ledger.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+            target()
+
+        row = ledger.get_durable_delegation(event["delegation_id"])
+        assert row["result"] == original
+        assert session["running"] is False
+        terminal = [payload for kind, payload in frames if kind == "message.complete"]
+        q = queue.Queue()
+        replayed = ledger.sweep_orphaned_completions(q, now=time.time() + ledger._ORPHAN_STALE_S + 1)
+        if failure_phase == "model_invoked":
+            assert row["delivery_state"] == "delivered"
+            assert [payload["status"] for payload in terminal] == ["error"]
+            assert replayed == 0
+        else:
+            assert terminal == []
+            assert row["delivery_state"] == "pending"
+            assert replayed == 1
+            assert q.get_nowait()["delegation_id"] == event["delegation_id"]
+    finally:
+        reset_hermes_home_override(token)

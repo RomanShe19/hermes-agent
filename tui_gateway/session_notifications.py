@@ -507,7 +507,9 @@ def _background_notifications_off(session: dict) -> bool:
 
 def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool:
     """Run the claimed (running=True) agent turn for one notification event."""
-    from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
+    from tools.async_delegation import (
+        claim_event_delivery, complete_event_delivery, release_event_delivery, requeue_admitted_completion,
+    )
     try:
         claim = claim_event_delivery(evt, "tui-poller")
     except Exception as exc:  # shared ledger busy/unreadable: the durable row stays pending and replays
@@ -532,6 +534,21 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
     from agent.notification_presentation import diagnostic_process_event
     if diagnostic_process_event(evt):
         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
+    delivery_lock = threading.Lock()
+    delivery_acked = input_rejected = False
+
+    def settle_rejected_input() -> None:
+        nonlocal input_rejected
+        with delivery_lock, _session_home_scope(session):
+            input_rejected = True
+            if delivery_acked:
+                requeue_admitted_completion(str(evt["delegation_id"]))
+            else:
+                release_event_delivery(evt, claim)
+
+    if claim:
+        kwargs["on_input_rejected"] = settle_rejected_input
+
     try:
         started = _notif_submit(
             f"__notif__{int(time.time() * 1000)}", sid, session, text,
@@ -543,7 +560,11 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
         # Admission already released the turn. Keep the durable result pending for its owner.
         release_event_delivery(evt, claim)
         return False
-    complete_event_delivery(evt, claim)
+    # A fast worker can reject input before _notif_submit returns. Keep the order of
+    # our acknowledgement and its rollback deterministic without blocking the worker start.
+    with delivery_lock:
+        if not input_rejected:
+            delivery_acked = complete_event_delivery(evt, claim)
     return True
 
 

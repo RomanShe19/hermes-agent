@@ -1118,7 +1118,8 @@ def _run_prompt_submit(
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     turn_author: dict | None = None,
     recovery_marker: tuple[str, int] | None = None,
-    resolve_context_refs: bool = True) -> bool:
+    resolve_context_refs: bool = True,
+    on_input_rejected: Callable[[], None] | None = None) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1151,6 +1152,7 @@ def _run_prompt_submit(
             notification_category=(display_metadata or {}).get("notification_category"),
             recovery_marker=recovery_marker, resolve_context_refs=resolve_context_refs)
         goal_followup = None
+        invoked = False
         _turn_started_monotonic = time.monotonic()
         try:
             # Only the running thread establishes acceptance; no prompt content is logged.
@@ -1178,6 +1180,7 @@ def _run_prompt_submit(
                     st.receipt_committed = True
                 return
             prompt, run_message, cols, streamer = prepared
+            invoked = True
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata, turn_author, text)
@@ -1198,6 +1201,11 @@ def _run_prompt_submit(
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:
+            if not invoked and on_input_rejected is not None:
+                try:
+                    on_input_rejected()
+                except Exception as exc:
+                    _hook_failure("notification input rejection", exc)
             _release_turn_scopes(sid, session, st)
             try:  # a raising settle step must not skip the trim / HERMES_HOME reset
                 _current_runtime_session_record.reset(runtime_session_token)

@@ -582,12 +582,12 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
              AND delivery_claim=?""", (now, now, delegation_id, claim_id), settled_id=delegation_id)
 
 
-def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
-    """Offer an acknowledged completion again when its receiving turn could not confirm the owner.
+def requeue_admitted_completion(delegation_id: str, target_queue=None) -> bool:
+    """Reopen an acknowledged result whose receiving turn failed before invoking the model.
 
-    The row returns to pending and its event goes back on ``target_queue``, so the next delivery
-    re-runs the pre-flight. A row past the delivery budget converges to ``dropped`` instead, which
-    bounds the loop; a row without a stored event is left as it is."""
+    With no queue, the ordinary orphan sweep will offer it again. The existing attempt budget
+    applies, and a row without a stored event is left as it is.
+    """
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         exhausted = conn.execute("""UPDATE async_delegations SET delivery_state='dropped', updated_at=?
@@ -604,13 +604,15 @@ def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
             (now, delegation_id))
         if reopened.rowcount != 1:
             return False
+        if target_queue is None:
+            return True
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchall()
         return _replay_pending(conn, rows, target_queue, now) == 1
 
 
-def complete_event_delivery(evt: dict[str, Any], claim_id: str) -> None:
-    _event_delivery(complete_completion_delivery, evt, claim_id)
+def complete_event_delivery(evt: dict[str, Any], claim_id: str) -> bool:
+    return _event_delivery(complete_completion_delivery, evt, claim_id)
 
 
 def release_event_delivery(evt: dict[str, Any], claim_id: str) -> None:
@@ -632,9 +634,9 @@ def return_completion_offer(evt: dict[str, Any]) -> None:
         _offered.difference_update({key for key in _offered if key[1] == delegation_id})
 
 
-def _event_delivery(fn, evt: dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
-        fn(str(evt.get("delegation_id") or ""), claim_id)
+def _event_delivery(fn, evt: dict[str, Any], claim_id: str) -> bool:
+    return bool(claim_id and evt.get("type") == "async_delegation"
+                and fn(str(evt.get("delegation_id") or ""), claim_id))
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[dict[str, Any]]:
