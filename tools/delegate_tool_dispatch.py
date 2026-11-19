@@ -349,7 +349,8 @@ _BACKGROUND_NOTES = {
     ),
 }
 
-def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]], inline_results: list[dict]) -> dict:
+def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]],
+                        inline_results: Optional[list[dict]] = None) -> dict:
     """Model-facing handle for accepted background units and any inline results."""
     goals = [t["goal"] for t in batch.task_list]
     background_count = sum(len(unit.children) for unit, _ in units)

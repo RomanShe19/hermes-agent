@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 # The delegate_tool_* siblings hold the pieces split out of this module; every name callers or patching tests reach as
 # ``tools.delegate_tool.<name>`` is re-imported here. Mutable flag globals live only in their owning module.
 from tools.delegate_tool_child_run import (
-    _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _dump_subagent_timeout_diagnostic, _fabricated_entry,
+    _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _close_child, _detach_child,
+    _dump_subagent_timeout_diagnostic, _fabricated_entry,
     _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
 )
 from tools.delegate_tool_config import (
@@ -418,7 +419,7 @@ def _build_children(
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[list[Optional[list[str]]]] = None,
 ) -> tuple[list[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
-    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
+    Return the built children even on a preflight failure so the caller can roll them back."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
     overrides = _credential_overrides(creds, routing_cfg)
@@ -436,7 +437,7 @@ def _build_children(
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
             )
         except ValueError as exc:
-            return [], str(exc)
+            return children, str(exc) or "Worker preflight failed."
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -579,7 +580,27 @@ def delegate_task(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
     )
-    if err:
+    if err is not None:
+        from tools.delegate_tool_results import _fire_subagent_stop_hooks
+        from tools.delegation_live_log import update_manifest_statuses
+
+        results = [
+            _fabricated_entry(i, "error" if i == len(children) else "rejected",
+                              err if i == len(children) else "Batch not started after worker preflight failed.",
+                              children[i][2] if i < len(children) else None)
+            for i in range(len(task_list))
+        ]
+        for i, _, child in children:
+            _detach_child(parent_agent, child)
+            _safe_progress(getattr(child, "tool_progress_callback", None), "subagent.complete",
+                           status="failed", preview=results[i]["error"])
+            _close_child(child, "Failed to close child after delegation preflight failure")
+        _fire_subagent_stop_hooks(results[:len(children)], {i: child for i, _, child in children}, parent_agent)
+        for entry, writer in zip(results, live_writers):
+            if writer is not None:
+                with _quiet("Live transcript finalize failed", exc_info=True):
+                    writer.finalize(entry)
+        update_manifest_statuses(live_deleg_id, results, home=_live_home)
         return tool_error(err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,

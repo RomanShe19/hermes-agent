@@ -567,3 +567,39 @@ def test_missing_transcript_keeps_existing_log_with_its_task(monkeypatch):
     payload = _dispatched_payload(batch, [(batch, batch.live_deleg_id)])
     assert payload["live_transcripts"] == [second_path]
     assert payload["task_transcripts"] == {"1": second_path}
+
+
+def test_child_preflight_failure_closes_unstarted_siblings_and_finalizes_logs(monkeypatch):
+    from tools import delegate_tool as dt
+
+    parent = _make_parent()
+    parent._active_children = []
+    first = MagicMock()
+    progress = MagicMock()
+    first.tool_progress_callback = progress
+
+    def build_child(**kwargs):
+        if kwargs["task_index"] == 1:
+            raise ValueError("worker preflight refused")
+        parent._active_children.append(first)
+        return first
+
+    monkeypatch.setattr(dt, "_build_child_preserving_parent_tools", build_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *args: _CREDS)
+    monkeypatch.setattr(dt, "_run_batch", lambda *a: pytest.fail("rejected batch must not start"))
+
+    result = json.loads(dt.delegate_task(
+        tasks=[{"goal": "Prepare first step"}, {"goal": "Rejected step"}, {"goal": "Remaining step"}],
+        parent_agent=parent,
+    ))
+
+    assert result["error"] == "worker preflight refused"
+    assert parent._active_children == []
+    first.close.assert_called_once_with()
+    progress.assert_called_once_with("subagent.complete", None,
+                                     "Batch not started after worker preflight failed.", None, status="failed")
+    [manifest_path] = live_transcript_root().glob("*/manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert [task["status"] for task in manifest["tasks"]] == ["rejected", "error", "rejected"]
+    assert manifest["completed"]
+    assert "end status=error" in (manifest_path.parent / "task-1.log").read_text(encoding="utf-8")
