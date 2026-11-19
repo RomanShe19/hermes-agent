@@ -135,6 +135,59 @@ def test_marker_survives_corrupt_sidecar(tmp_path):
     assert read_turn_marker(tmp_path, "abc")["prompt"] == "prompt"
 
 
+_COMPETING_MARKER = """
+import fcntl
+import sys
+from pathlib import Path
+from tui_gateway.turn_marker import record_turn_start
+
+home = Path(sys.argv[1])
+with (home / "desktop" / "interrupted_turns.json.lock").open("a+b") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(75)
+record_turn_start(home, "sibling", "continue work B")
+"""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="probe the lock used by the deployed Linux backends")
+@pytest.mark.parametrize("operation", ["record", "clear"])
+def test_marker_update_does_not_overwrite_a_sibling_backend(tmp_path, monkeypatch, operation):
+    from tui_gateway import turn_marker
+
+    record_turn_start(tmp_path, "first", "continue work A")
+    actual_load = turn_marker._load
+
+    def sibling_update():
+        return subprocess.run(
+            [sys.executable, "-c", _COMPETING_MARKER, str(tmp_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+
+    attempts = []
+    with monkeypatch.context() as patch:
+        def load_then_race(path):
+            entries = actual_load(path)
+            attempts.append(sibling_update())
+            return entries
+
+        patch.setattr(turn_marker, "_load", load_then_race)
+        if operation == "record":
+            record_turn_start(tmp_path, "first", "updated work A")
+        else:
+            clear_turn_marker(tmp_path, "first")
+
+    assert len(attempts) == 1
+    assert attempts[0].returncode == 75, attempts[0].stderr
+    attempt = sibling_update()
+    assert attempt.returncode == 0, attempt.stderr
+    sibling = read_turn_marker(tmp_path, "sibling")
+    assert sibling and sibling["prompt"] == "continue work B"
+    first = read_turn_marker(tmp_path, "first")
+    assert (first["prompt"] if first else None) == ("updated work A" if operation == "record" else None)
+
+
 def _patch_local_interrupt(monkeypatch, session):
     monkeypatch.setattr(server, "_tts_stream_stop", lambda: None)
     monkeypatch.setattr(server, "_sess_nowait", lambda params, rid: (session, None))

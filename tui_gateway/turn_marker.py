@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -24,8 +23,6 @@ _MAX_AGE_SECS = 24 * 3600
 _MAX_ENTRIES = 32
 # Enough to re-submit any realistic prompt; guards against a multi-megabyte paste being journaled.
 _MAX_PROMPT_CHARS = 64_000
-
-_lock = threading.Lock()
 
 
 def _marker_path(home: Path | str) -> Path:
@@ -101,10 +98,15 @@ def _store(path: Path, entries: dict[str, dict]) -> None:
 
 
 def _update(home: Path | str, session_key: str, mutate, what: str) -> None:
-    """Load → ``mutate(entries)`` → store under the lock; ``mutate`` returns None to skip the write."""
+    """Serialize the full read-modify-write across backends sharing this profile."""
+    from hermes_cli.active_sessions import _FileLock
+    from hermes_constants import mkdir_under_hermes_home
+
     try:
-        with _lock:
-            path = _marker_path(home)
+        path = _marker_path(home)
+        mkdir_under_hermes_home(path.parent)
+        # Lock a stable sibling inode, since writing or clearing replaces the JSON inode.
+        with _FileLock(path.with_suffix(".json.lock")):
             entries = mutate(_load(path))
             if entries is not None:
                 _store(path, entries)
@@ -133,7 +135,7 @@ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attemp
 
 def clear_turn_marker(home: Path | str, session_key: str) -> None:
     """Remove the marker once its turn concluded (any outcome the client saw)."""
-    if session_key:
+    if session_key and _marker_path(home).parent.is_dir():
         _update(home, session_key, lambda e: {k: v for k, v in e.items() if k != session_key} if session_key in e else None, "clear")
 
 
@@ -142,8 +144,8 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
     if not session_key:
         return None
     try:
-        with _lock:
-            entry = _load(_marker_path(home)).get(session_key)
+        # Atomic replacement makes each open a complete snapshot. Reads need not create a lock file.
+        entry = _load(_marker_path(home)).get(session_key)
         prompt = str(entry.get("prompt") or "") if isinstance(entry, dict) else ""
         if not prompt.strip():
             return None
