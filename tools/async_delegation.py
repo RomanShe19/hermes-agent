@@ -384,7 +384,8 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
     started; this covers the rest while it runs. Abandoned in-flight rows are first classified by
     ``recover_abandoned_delegations``. A terminal row qualifies when it is pending with an event, idle
     past ``_ORPHAN_STALE_S``, not under a live delivery claim, and its owner fails the shared liveness
-    check, unless a prior delivery attempt explicitly released its claim. A row is offered once per live
+    check, unless the local publisher left no queued copy or a prior delivery attempt released its claim.
+    A row is offered once per live
     in-memory copy: a consumer that discards the copy with the row still pending hands it back for the next sweep. The consumer's ``claim_completion_delivery`` stays
     the atomic cross-process gate, so two processes offering one row never both deliver it. Rows past
     the delivery budget or the replay age converge to ``dropped``. Reads the current profile's ledger:
@@ -407,8 +408,9 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
                ORDER BY completed_at, delegation_id""", (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S)).fetchall()
         orphans = []
+        local_pid = os.getpid()
         for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts, released in rows:
-            if delegation_id in offered or (not released and alive(pid, started)):
+            if delegation_id in offered or (not released and pid != local_pid and alive(pid, started)):
                 continue
             if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
                 # Its last claimant died holding the final attempt; converge like release_completion_delivery.
@@ -974,16 +976,10 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
 def _push_completion_event(record: dict[str, Any], result: dict[str, Any], status: str) -> None:
     """Push a type='async_delegation' event onto the shared completion queue. Batch records
     (``is_batch``) carry the per-task ``results`` list (plus live transcript paths, the
-    full-fidelity record of each child's run) instead of a single summary. Best-effort: failure
-    must not crash the worker, but it WOULD mean a silently-lost result, so we log loudly."""
+    full-fidelity record of each child's run) instead of a single summary. Persist first
+    so a failure on the live delivery path leaves the result eligible for recovery."""
     is_batch = bool(record.get("is_batch"))
     label = " batch" if is_batch else ""
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(f"Async delegation{label} %s finished but process_registry import failed; "
-                     "result lost: %s", record.get("delegation_id"), exc)
-        return
     dispatched_at = record.get("dispatched_at") or time.time()
     completed_at = record.get("completed_at") or time.time()
     if is_batch:
@@ -1014,20 +1010,25 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
     offer_key = (hermes_home_key(get_hermes_home()), evt["delegation_id"])
     with _orphan_lock:
         _offered.add(offer_key)
+    persisted = False
     try:
         _persist_completion(evt, result)
+        persisted = True
     except Exception as exc:
         with _orphan_lock:
             _offered.discard(offer_key)
         logger.error(f"Async delegation{label} %s: durable completion write failed; delivering in-memory "
                      "only (a restart may report this unit as unknown): %s", record.get("delegation_id"), exc)
     try:
+        from tools.process_registry import process_registry
+
         process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         with _orphan_lock:
             _offered.discard(offer_key)
-        logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
-                     "result lost: %s", record.get("delegation_id"), exc)
+        outcome = "result pending for replay" if persisted else "result lost"
+        logger.error(f"Async delegation{label} %s: live delivery failed (%s): %s",
+                     record.get("delegation_id"), outcome, exc)
 
 
 def push_task_failure_notice(delegation_id: str, entry: dict[str, Any], *, n_tasks: int) -> None:

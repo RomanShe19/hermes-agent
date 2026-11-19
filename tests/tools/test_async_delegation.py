@@ -1384,3 +1384,35 @@ def test_dispatch_during_monitor_exit_still_detects_stall(monkeypatch):
     finally:
         finish_scan.set()
         release_worker.set()
+
+
+@pytest.mark.parametrize("failure", ["import", "enqueue"])
+def test_completion_survives_unavailable_live_queue(monkeypatch, failure):
+    import queue
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("live queue unavailable")
+
+    with monkeypatch.context() as fault:
+        if failure == "import":
+            fault.setitem(sys.modules, "tools.process_registry", None)
+        else:
+            fault.setattr(process_registry.completion_queue, "put", unavailable)
+        handle = ad.dispatch_async_delegation(
+            goal="save terminal result", context=None, toolsets=None, role="leaf", model=None,
+            session_key="owner", runner=lambda: {"status": "completed", "summary": "durable result"},
+        )
+        deadline = time.monotonic() + 5
+        while ad.active_count() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ad.active_count() == 0
+        row = ad.get_durable_delegation(handle["delegation_id"])
+        assert (row["state"], row["delivery_state"]) == ("completed", "pending")
+
+    recovered = queue.Queue()
+    now = time.time() + ad._ORPHAN_STALE_S + 1
+    assert ad.sweep_orphaned_completions(recovered, now=now) == 1
+    event = recovered.get_nowait()
+    assert event["delegation_id"] == handle["delegation_id"]
+    assert event["summary"] == "durable result"
+    assert ad.sweep_orphaned_completions(recovered, now=now + 1) == 0
