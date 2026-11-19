@@ -1135,6 +1135,7 @@ def _stale_monitor_loop() -> None:
     record's timestamp; a frozen token past the idle/in-tool threshold marks the record
     ``stalling`` and calls ``interrupt_fn``; a ``stalling`` record still unreturned after the
     grace window is force-finalized with a terminal ``stalled`` event."""
+    global _monitor_thread
     while not _monitor_stop.wait(_STALE_CHECK_INTERVAL):
         now = time.time()
         with _records_lock:
@@ -1151,7 +1152,18 @@ def _stale_monitor_loop() -> None:
                 ctx = (_records.get(delegation_id) or {}).get("_context") or contextvars.copy_context()
             ctx.run(_finalize, delegation_id, lambda rec, d=delegation_id: _stalled_result(d, rec), "stalled")
         if not any_monitorable:
-            return
+            # A dispatch may have registered work since the empty scan. Serialize the
+            # decision to retire with _ensure_stale_monitor, which otherwise sees us alive.
+            with _monitor_lock, _records_lock:
+                if any(
+                    record["status"] == "stalling"
+                    or (record["status"] == "running" and record.get("progress_fn") is not None)
+                    for record in _records.values()
+                ):
+                    continue
+                if _monitor_thread is threading.current_thread():
+                    _monitor_thread = None
+                return
 
 
 def _stalled_error_text(event_record: dict[str, Any]) -> str:

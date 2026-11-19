@@ -1348,3 +1348,39 @@ def test_monitor_start_failure_does_not_hide_running_worker(monkeypatch, caplog)
     event = _drain_for(handle["delegation_id"])
     assert event and event["status"] == "completed" and event["summary"] == "verified"
     assert runs == ["started"]
+
+
+def test_dispatch_during_monitor_exit_still_detects_stall(monkeypatch):
+    _fast_stale_monitor(monkeypatch)
+    empty_scan, finish_scan, release_worker = threading.Event(), threading.Event(), threading.Event()
+    original_sweep = ad._sweep_stale_locked
+
+    class PauseAfterEmptyScan:
+        def __bool__(self):
+            empty_scan.set()
+            finish_scan.wait(8)
+            return False
+
+    def sweep(now):
+        stalled, expired, monitorable = original_sweep(now)
+        if not monitorable and not empty_scan.is_set():
+            # The monitor tests this verdict after releasing the records lock.
+            return stalled, expired, PauseAfterEmptyScan()
+        return stalled, expired, monitorable
+
+    monkeypatch.setattr(ad, "_sweep_stale_locked", sweep)
+    ad._ensure_stale_monitor()
+    try:
+        assert empty_scan.wait(5)
+        handle = ad.dispatch_async_delegation(
+            goal="observe a stuck worker", context=None, toolsets=None, role="leaf", model=None,
+            session_key="owner", runner=lambda: (release_worker.wait(8), {"status": "completed"})[1],
+            progress_fn=lambda: ((0, None), False),
+        )
+        assert handle["status"] == "dispatched"
+        finish_scan.set()
+        event = _drain_for(handle["delegation_id"], timeout=3)
+        assert event is not None and event["status"] == "stalled"
+    finally:
+        finish_scan.set()
+        release_worker.set()
