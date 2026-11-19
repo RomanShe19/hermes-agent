@@ -1,5 +1,6 @@
 """Background delegations cannot outlive the admission proof used to retire their process."""
 
+from queue import Queue
 import threading
 
 
@@ -7,7 +8,11 @@ def test_async_delegations_hold_busy_accounting_through_finalization(tmp_path, m
     from hermes_cli import backend_retirement
     from hermes_cli.web_server_idle_proof import idle_proof
     from tools import async_delegation
+    from tools.process_registry import process_registry
 
+    monkeypatch.setattr(async_delegation, "_executor", None)
+    monkeypatch.setattr(async_delegation, "_executor_max_workers", 0)
+    monkeypatch.setattr(process_registry, "completion_queue", Queue())
     fence = backend_retirement.RetirementFence()
     monkeypatch.setattr(backend_retirement, "retirement", fence)
     entered, release = threading.Event(), threading.Event()
