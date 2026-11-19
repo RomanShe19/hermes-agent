@@ -331,16 +331,12 @@ def _batch_progress_token(child_agents: list[Any]) -> tuple:
     return tuple(parts), in_tool
 
 _BACKGROUND_NOTES = {
-    "one": (
-        "Subagent is running in the background; its full result re-enters the conversation as a new message when it "
-        "finishes. Results are delivered only after you END YOUR TURN: do anything that does not depend on it, then "
-        "stop with a one-line status. Do not poll its transcript or artifacts to wait for it."
-    ),
-    "many": (
-        "{n} subagents are running in parallel in the background as {k} completion unit(s); each unit's results "
-        "re-enter the conversation as their own new message when THAT unit finishes. Results are delivered only "
-        "after you END YOUR TURN: do anything that does not depend on them, then stop with a one-line status. Do not "
-        "poll transcripts or artifacts to wait for them."
+    "one": "One subagent was accepted for background execution.",
+    "many": "{n} subagents were accepted for background execution as {k} completion unit(s).",
+    "timing": (
+        "Each unit's result re-enters the conversation as a new message between your turns. "
+        "Continue authorized work that can run now. If all remaining work depends on a pending result, "
+        "yield for its completion message instead of polling."
     ),
     "control_hint": (
         "While a child runs you can orchestrate it live with this same tool: delegate_task(action='list') to see live "
@@ -353,16 +349,22 @@ _BACKGROUND_NOTES = {
     ),
 }
 
-def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]]) -> dict:
-    """Model-facing handle for an accepted background call: one entry per async unit."""
+def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]], inline_results: list[dict]) -> dict:
+    """Model-facing handle for accepted background units and any inline results."""
     goals = [t["goal"] for t in batch.task_list]
-    n = len(goals)
+    background_count = sum(len(unit.children) for unit, _ in units)
+    note = (_BACKGROUND_NOTES["one"] if background_count == 1
+            else _BACKGROUND_NOTES["many"].format(n=background_count, k=len(units)))
     payload = {
-        "status": "dispatched", "mode": "background", "count": n,
+        "status": "dispatched", "mode": "background", "count": len(goals),
+        "background_count": background_count,
         "delegation_id": batch.live_deleg_id or units[0][1], "goals": goals,
-        "note": _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(n=n, k=len(units)),
     }
-    if len(units) > 1:
+    if inline_results:
+        payload["inline_results"] = inline_results
+        note += f" {len(inline_results)} task(s) returned inline; their results are included."
+    payload["note"] = f"{note} {_BACKGROUND_NOTES['timing']}"
+    if len(units) > 1 or background_count != len(goals):
         payload["units"] = [
             {"delegation_id": uid, "group": unit.group, "task_indexes": [i for (i, _, _) in unit.children]}
             for unit, uid in units
@@ -478,10 +480,7 @@ def _dispatch_background(batch: _Batch) -> str:
         # the unit inline so no task is silently dropped.
         logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.", k + 1, len(units), dispatch.get("error"))
         inline_results.extend(_execute_and_aggregate(unit)["results"])
-    payload = _dispatched_payload(batch, dispatched)
-    if inline_results:
-        payload["inline_results"] = inline_results
-    return json.dumps(payload, ensure_ascii=False)
+    return json.dumps(_dispatched_payload(batch, dispatched, inline_results), ensure_ascii=False)
 
 def _run_batch(batch: _Batch, background: bool) -> str:
     """Tool result JSON: a dispatch handle (background) or the joined combined results."""

@@ -240,6 +240,14 @@ def test_rejected_background_child_stops_with_parent(
             assert result["results"][0]["status"] == "interrupted"
         else:
             assert result["status"] == "dispatched"
+            assert result["count"] == 3
+            assert result["background_count"] == 2
+            assert [unit["delegation_id"] for unit in result["units"]] == accepted_ids
+            assert [unit["task_indexes"] for unit in result["units"]] == [[0], [2]]
+            assert [entry["task_index"] for entry in result["inline_results"]] == [1]
+            assert "1 task(s) returned inline" in result["note"]
+            assert "all remaining work depends" in result["note"]
+            assert "stop with a one-line status" not in result["note"]
             assert result["inline_results"][0]["status"] == "interrupted"
             assert not background_child.stop_received.is_set()
             assert pending_child.unwinding.wait(5)
