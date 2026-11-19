@@ -133,10 +133,25 @@ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attemp
     _update(home, session_key, lambda entries: {**_prune(entries, now), session_key: entry}, "record")
 
 
-def clear_turn_marker(home: Path | str, session_key: str) -> None:
-    """Remove the marker once its turn concluded (any outcome the client saw)."""
-    if session_key and _marker_path(home).parent.is_dir():
-        _update(home, session_key, lambda e: {k: v for k, v in e.items() if k != session_key} if session_key in e else None, "clear")
+def clear_turn_marker(home: Path | str, session_key: str, *, expected: dict[str, Any] | None = None) -> None:
+    """Remove the turn marker, optionally only if it still matches the observed generation."""
+    if not session_key or not _marker_path(home).parent.is_dir():
+        return
+
+    def remove(entries: dict[str, dict]) -> dict[str, dict] | None:
+        current = entries.get(session_key)
+        if current is None:
+            return None
+        if expected is not None and (
+            _started_at(current) != expected["started_at"]
+            or any(current.get(key) != expected.get(key)
+                   for key in ("writer_pid", "writer_start_time", "prompt"))
+        ):
+            return None
+        del entries[session_key]
+        return entries
+
+    _update(home, session_key, remove, "clear")
 
 
 def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | None:

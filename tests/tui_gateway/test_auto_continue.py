@@ -536,6 +536,21 @@ def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkey
     assert read_turn_marker(marker_home, "session-key") is None
 
 
+def test_stale_recovery_check_does_not_remove_a_new_marker(marker_home, monkeypatch):
+    record_turn_start(marker_home, "session-key", "expired request")
+    clock = time.time()
+    monkeypatch.setattr(server.time, "time", lambda: clock + 120)
+
+    def config_after_replacement():
+        record_turn_start(marker_home, "session-key", "latest request")
+        return True, 60, 2
+
+    monkeypatch.setattr(server, "_auto_continue_config", config_after_replacement)
+    assert server._maybe_schedule_auto_continue("sid", _session(), "session-key") is None
+    fresh = read_turn_marker(marker_home, "session-key")
+    assert fresh and fresh["prompt"] == "latest request"
+
+
 def test_config_widens_freshness_window(emits, schedule_env, marker_home, monkeypatch):
     record_turn_start(marker_home, "session-key", "old prompt")
     monkeypatch.setattr(

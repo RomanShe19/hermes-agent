@@ -80,7 +80,8 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     enabled, freshness_secs, max_attempts = _auto_continue_config()
     age = time.time() - marker["started_at"]
     if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
-        clear_turn_marker(home, session_key)  # stale/disabled/crash-looping: a manual message continues
+        # Another backend can replace the marker after we inspected its age or attempts.
+        clear_turn_marker(home, session_key, expected=marker)
         return None
     reservation = object()
     with session["history_lock"]:
