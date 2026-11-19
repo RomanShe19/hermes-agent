@@ -352,7 +352,7 @@ def test_offer_dropped_by_a_session_that_cannot_own_it_is_re_offered_to_the_owne
     started = []
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
     def accept_turn(rid, sid, session, text, **kwargs):
-        started.append(sid)
+        started.append((sid, kwargs["on_input_ready"]()))
         return True
 
     monkeypatch.setattr(server, "_run_prompt_submit", accept_turn)
@@ -372,7 +372,7 @@ def test_offer_dropped_by_a_session_that_cannot_own_it_is_re_offered_to_the_owne
         monkeypatch.setitem(server._sessions, "sid-owner", owner)  # the owner resumes
         assert ad.sweep_orphaned_completions(q, now=later + ad.ORPHAN_SWEEP_INTERVAL_S) == 1
         drain("sid-owner", owner)
-    assert started == ["sid-owner"]
+    assert started == [("sid-owner", True)]
     assert _row(home, delegation_id)["delivery_state"] == "delivered"
     with _Home(home):  # delivered rows are never offered again
         assert ad.sweep_orphaned_completions(q, now=later + 2 * ad.ORPHAN_SWEEP_INTERVAL_S) == 0
@@ -475,3 +475,25 @@ def test_background_capacity_is_shared_and_ignores_dead_owners(tmp_path):
         accepted = try_dispatch()
         assert accepted["status"] == "dispatched"
         assert runner_called.wait(5)
+
+
+def test_expired_receiver_claim_is_reoffered_with_live_producer(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    delegation_id = _orphan(home)
+    producer_pid = os.getpid() + 1
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda pid, _started: pid == producer_pid)
+    events = queue.Queue()
+    with _Home(home):
+        assert ad.claim_completion_delivery(delegation_id, "first-receiver")
+        claim_at = time.time() - ad._CLAIM_LEASE_S - 1
+        _set(home, delegation_id, owner_pid=producer_pid, delivery_claimed_at=claim_at, updated_at=claim_at)
+        assert ad.sweep_orphaned_completions(events, now=claim_at + ad._CLAIM_LEASE_S - 1) == 0
+        assert ad.sweep_orphaned_completions(events) == 1
+        assert ad.sweep_orphaned_completions(events) == 0
+        event = events.get_nowait()
+        assert event["delegation_id"] == delegation_id
+        new_claim = ad.claim_event_delivery(event, "new-receiver")
+        assert new_claim
+        assert not ad.complete_event_delivery(event, "first-receiver")
+        assert ad.complete_event_delivery(event, new_claim)
+        assert events.empty()

@@ -263,7 +263,7 @@ def test_refused_prompt_keeps_durable_delegation_pending_until_accepted(monkeypa
             if len(submitted) == 1:
                 session["running"] = False
                 return False
-            return True
+            return kwargs["on_input_ready"]()
 
         monkeypatch.setattr(server, "_run_prompt_submit", submit)
         session = _claimed_session()

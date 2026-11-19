@@ -83,6 +83,19 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
         # Another backend can replace the marker after we inspected its age or attempts.
         clear_turn_marker(home, session_key, expected=marker)
         return None
+    delegation_id = marker.get("delegation_id")
+    if delegation_id:
+        # Until input is acknowledged, the durable delegation ledger owns replay.
+        from tools.async_delegation import get_durable_delegation
+
+        try:
+            with _session_home_scope(session):
+                delivery = get_durable_delegation(delegation_id)
+        except Exception as exc:
+            _notif_log_failure("auto-continue delivery lookup failed", exc)
+            return None
+        if delivery is None or delivery["delivery_state"] != "delivered":
+            return None
     reservation = object()
     with session["history_lock"]:
         if session.get("_auto_continue_scheduled"):
@@ -128,6 +141,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                     rid, sid, session, text, display_kind="auto_continue",
                     recovery_marker=(marker["prompt"], attempt),
                     resolve_context_refs=marker.get("resolve_context_refs", True),
+                    **({"completion_delegation_id": delegation_id} if delegation_id else {}),
                     **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
         except Exception as exc:
             _notif_log_failure("auto-continue dispatch failed", exc)

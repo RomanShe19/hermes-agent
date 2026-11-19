@@ -508,7 +508,7 @@ def _background_notifications_off(session: dict) -> bool:
 def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool:
     """Run the claimed (running=True) agent turn for one notification event."""
     from tools.async_delegation import (
-        claim_event_delivery, complete_event_delivery, release_event_delivery, requeue_admitted_completion,
+        claim_event_delivery, complete_event_delivery, release_event_delivery, return_completion_offer,
     )
     try:
         claim = claim_event_delivery(evt, "tui-poller")
@@ -520,6 +520,7 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
         # the target. No turn will run, and nothing else clears ``running``: a busy session is exempt
         # from the reaper, keeps its lease, and never reaches its bot mailbox again.
         _notif_release_turn(session)
+        return_completion_offer(evt)
         return False
     evt_type = evt.get("type")
     kwargs: dict = {}
@@ -534,20 +535,17 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
     from agent.notification_presentation import diagnostic_process_event
     if diagnostic_process_event(evt):
         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
-    delivery_lock = threading.Lock()
-    delivery_acked = input_rejected = False
+    if claim and evt_type == "async_delegation":
+        def acknowledge_input() -> bool:
+            with _session_home_scope(session):
+                return complete_event_delivery(evt, claim)
 
-    def settle_rejected_input() -> None:
-        nonlocal input_rejected
-        with delivery_lock, _session_home_scope(session):
-            input_rejected = True
-            if delivery_acked:
-                requeue_admitted_completion(str(evt["delegation_id"]))
-            else:
+        def release_unprepared_input() -> None:
+            with _session_home_scope(session):
                 release_event_delivery(evt, claim)
 
-    if claim:
-        kwargs["on_input_rejected"] = settle_rejected_input
+        kwargs.update(on_input_ready=acknowledge_input, on_input_rejected=release_unprepared_input,
+                      completion_delegation_id=str(evt["delegation_id"]))
 
     try:
         started = _notif_submit(
@@ -560,11 +558,6 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
         # Admission already released the turn. Keep the durable result pending for its owner.
         release_event_delivery(evt, claim)
         return False
-    # A fast worker can reject input before _notif_submit returns. Keep the order of
-    # our acknowledgement and its rollback deterministic without blocking the worker start.
-    with delivery_lock:
-        if not input_rejected:
-            delivery_acked = complete_event_delivery(evt, claim)
     return True
 
 

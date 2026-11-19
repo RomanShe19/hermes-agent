@@ -114,7 +114,7 @@ def test_delegation_completion_reference_is_literal(turn_env, marker_home, monke
     assert len(invoked) == 1 and text in invoked[0]
 
 
-@pytest.mark.parametrize("failure_phase", ["before_ack", "after_ack", "model_invoked"])
+@pytest.mark.parametrize("failure_phase", ["before_ack", "queued", "claim_lost", "model_invoked"])
 def test_only_unprepared_completion_can_replay(turn_env, marker_home, monkeypatch, failure_phase):
     import queue
     import time
@@ -128,9 +128,12 @@ def test_only_unprepared_completion_can_replay(turn_env, marker_home, monkeypatc
             raise RuntimeError("failure after entering the model path")
 
         monkeypatch.setattr(server, "_invoke_agent", fail_after_start)
+    elif failure_phase == "claim_lost":
+        monkeypatch.setattr(ledger, "complete_event_delivery", lambda *args: False)
+        monkeypatch.setattr(server, "_invoke_agent", lambda *args: pytest.fail("lost claim ran the model"))
     else:
         monkeypatch.setattr(server, "_prepare_turn_input", lambda *args: None)
-    if failure_phase == "after_ack":
+    if failure_phase == "queued":
         monkeypatch.setattr(server, "_start_session_work",
                             lambda target, **kwargs: scheduled.append(target) or object())
     agent = SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None,
@@ -144,9 +147,11 @@ def test_only_unprepared_completion_can_replay(turn_env, marker_home, monkeypatc
         ledger._persist_dispatch(event)
         ledger._persist_completion(event, original)
         assert server._notif_dispatch_event("sid", session, event, "result")
-        if failure_phase == "after_ack":
+        if failure_phase == "queued":
             [target] = scheduled
-            assert ledger.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+            row = ledger.get_durable_delegation(event["delegation_id"])
+            assert row["delivery_state"] == "pending"
+            assert row["delivery_attempts"] == 1
             target()
 
         row = ledger.get_durable_delegation(event["delegation_id"])
@@ -161,8 +166,23 @@ def test_only_unprepared_completion_can_replay(turn_env, marker_home, monkeypatc
             assert replayed == 0
         else:
             assert terminal == []
+            assert not any(kind == "message.start" for kind, _ in frames)
             assert row["delivery_state"] == "pending"
             assert replayed == 1
             assert q.get_nowait()["delegation_id"] == event["delegation_id"]
     finally:
         reset_hermes_home_override(token)
+
+
+def test_legacy_completion_without_ledger_still_runs(turn_env, marker_home, monkeypatch):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    invoked = []
+    monkeypatch.setattr(server, "_invoke_agent", lambda *args: invoked.append(args))
+    event = {"type": "async_delegation", "delegation_id": "legacy", "status": "completed"}
+    token = set_hermes_home_override(str(marker_home))
+    try:
+        assert server._notif_dispatch_event("sid", _session(running=True), event, "legacy result")
+    finally:
+        reset_hermes_home_override(token)
+    assert len(invoked) == 1

@@ -177,7 +177,8 @@ def _admit_prompt_turn(
 def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
                         notification_category: str | None = None,
                         recovery_marker: tuple[str, int] | None = None,
-                        resolve_context_refs: bool = True) -> str:
+                        resolve_context_refs: bool = True,
+                        completion_delegation_id: str | None = None) -> str:
     """Write the durable crash marker; returns the session key it was written under (compression
     can rotate session_key mid-turn).  A surviving marker means the process died mid-turn.
     The key is published before the disk write so an interrupt racing startup can retire
@@ -191,7 +192,8 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
         record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
                           auto_continue=auto_continue, resolve_context_refs=resolve_context_refs,
                           **({"notification_category": "diagnostic"}
-                             if notification_category == "diagnostic" else {}))
+                             if notification_category == "diagnostic" else {}),
+                          **({"delegation_id": completion_delegation_id} if completion_delegation_id else {}))
         with session["history_lock"]:
             marker_cancelled = bool(session.get("_turn_cancel_requested"))
         if marker_cancelled:
@@ -1119,7 +1121,9 @@ def _run_prompt_submit(
     turn_author: dict | None = None,
     recovery_marker: tuple[str, int] | None = None,
     resolve_context_refs: bool = True,
-    on_input_rejected: Callable[[], None] | None = None) -> bool:
+    on_input_ready: Callable[[], bool] | None = None,
+    on_input_rejected: Callable[[], None] | None = None,
+    completion_delegation_id: str | None = None) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1150,7 +1154,8 @@ def _run_prompt_submit(
             receipt_committed=terminal_callback is None)
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
             notification_category=(display_metadata or {}).get("notification_category"),
-            recovery_marker=recovery_marker, resolve_context_refs=resolve_context_refs)
+            recovery_marker=recovery_marker, resolve_context_refs=resolve_context_refs,
+            completion_delegation_id=completion_delegation_id)
         goal_followup = None
         invoked = False
         _turn_started_monotonic = time.monotonic()
@@ -1167,7 +1172,7 @@ def _run_prompt_submit(
                 "kind=%s chars=%s images=%d",
                 sid, session.get("session_key") or "", getattr(agent, "session_id", "") or "",
                 display_kind or "user", len(text) if isinstance(text, str) else "-", len(images))
-            if not muted:
+            if not muted and on_input_ready is None:
                 if display_kind == "auto_continue":
                     _emit("status.update", sid, {"kind": "process", "text": "Resuming interrupted turn…"})
                 _emit("message.start", sid)
@@ -1180,6 +1185,11 @@ def _run_prompt_submit(
                     st.receipt_committed = True
                 return
             prompt, run_message, cols, streamer = prepared
+            if on_input_ready is not None:
+                if not on_input_ready():
+                    return  # The claim changed while preparing input. Its current owner handles delivery.
+                if not muted:
+                    _emit("message.start", sid)
             invoked = True
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,

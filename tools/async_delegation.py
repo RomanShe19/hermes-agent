@@ -410,13 +410,13 @@ def _replay_pending(conn, rows, target_queue, now: float) -> int:
 
 
 def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> int:
-    """Re-offer this home's completions after owner loss or a released delivery attempt.
+    """Re-offer this home's completions after owner loss or an abandoned delivery attempt.
 
     Startup replay (``restore_undelivered_completions``) covers owners that died before the process
     started; this covers the rest while it runs. Abandoned in-flight rows are first classified by
     ``recover_abandoned_delegations``. A terminal row qualifies when it is pending with an event, idle
     past ``_ORPHAN_STALE_S``, not under a live delivery claim, and its owner fails the shared liveness
-    check, unless the local publisher left no queued copy or a prior delivery attempt released its claim.
+    check, unless the local publisher left no queued copy or a prior claim was released or expired.
     A row is offered once per live
     in-memory copy: a consumer that discards the copy with the row still pending hands it back for the next sweep. The consumer's ``claim_completion_delivery`` stays
     the atomic cross-process gate, so two processes offering one row never both deliver it. Rows past
@@ -432,8 +432,7 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
         offered = {delegation_id for key, delegation_id in _offered if key == home}
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at,
-                      owner_pid, owner_started_at, delivery_attempts,
-                      delivery_claim IS NULL AND delivery_attempts > 0 AS released_attempt
+                      owner_pid, owner_started_at, delivery_attempts
                FROM async_delegations
                WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
                  AND event_json IS NOT NULL AND updated_at < ?
@@ -441,8 +440,8 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
                ORDER BY completed_at, delegation_id""", (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S)).fetchall()
         orphans = []
         local_pid = os.getpid()
-        for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts, released in rows:
-            if delegation_id in offered or (not released and pid != local_pid and alive(pid, started)):
+        for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts in rows:
+            if delegation_id in offered or (not attempts and pid != local_pid and alive(pid, started)):
                 continue
             if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
                 # Its last claimant died holding the final attempt; converge like release_completion_delivery.
@@ -494,20 +493,25 @@ def mark_completion_delivered(delegation_id: str) -> bool:
         (now, now, delegation_id), settled_id=delegation_id)
 
 
-def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Claim one pending completion across competing consumers/processes."""
+def _claim_completion(delegation_id: str, claim_id: str) -> bool | None:
+    """Claim a pending row, or return None for a legacy event without a row."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             "SELECT delivery_state FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
         if row is None:
-            return True  # legacy event created before durable dispatch
+            return None
         cur = conn.execute("""UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
             (claim_id, now, now, delegation_id, now - _CLAIM_LEASE_S))
         return cur.rowcount == 1
+
+
+def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Claim one pending completion, allowing legacy events without a durable row."""
+    return _claim_completion(delegation_id, claim_id) is not False
 
 
 def is_interim_delegation_event(evt: dict[str, Any]) -> bool:
@@ -525,7 +529,10 @@ def claim_event_delivery(evt: dict[str, Any], consumer: str) -> Optional[str]:
     if not delegation_id:
         return ""
     claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
-    return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+    claimed = _claim_completion(delegation_id, claim_id)
+    if claimed is None:
+        return ""
+    return claim_id if claimed else None
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -582,12 +589,8 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
              AND delivery_claim=?""", (now, now, delegation_id, claim_id), settled_id=delegation_id)
 
 
-def requeue_admitted_completion(delegation_id: str, target_queue=None) -> bool:
-    """Reopen an acknowledged result whose receiving turn failed before invoking the model.
-
-    With no queue, the ordinary orphan sweep will offer it again. The existing attempt budget
-    applies, and a row without a stored event is left as it is.
-    """
+def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
+    """Reopen an acknowledged result whose receiving turn failed before invoking the model."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         exhausted = conn.execute("""UPDATE async_delegations SET delivery_state='dropped', updated_at=?
@@ -604,8 +607,6 @@ def requeue_admitted_completion(delegation_id: str, target_queue=None) -> bool:
             (now, delegation_id))
         if reopened.rowcount != 1:
             return False
-        if target_queue is None:
-            return True
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchall()
         return _replay_pending(conn, rows, target_queue, now) == 1

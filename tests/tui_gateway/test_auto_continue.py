@@ -749,3 +749,34 @@ def test_second_backend_defers_to_a_live_marker_writer(emits, schedule_env, mark
         if child.poll() is None:
             child.kill()
         child.wait(timeout=10)
+
+
+@pytest.mark.parametrize("acknowledged", [False, True])
+def test_delegation_marker_defers_to_pending_ledger(schedule_env, marker_home, acknowledged):
+    from tools import async_delegation as ledger
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    delegation_id = "crash-boundary"
+    event = {"type": "async_delegation", "delegation_id": delegation_id,
+             "session_key": "session-key", "dispatched_at": time.time()}
+    record_turn_start(marker_home, "session-key", "worker result", resolve_context_refs=False,
+                      delegation_id=delegation_id)
+    token = set_hermes_home_override(str(marker_home))
+    try:
+        ledger._persist_dispatch(event)
+        ledger._persist_completion(event, {"status": "completed"})
+        if acknowledged:
+            claim = ledger.claim_event_delivery(event, "receiver")
+            assert ledger.complete_event_delivery(event, claim)
+        result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
+    finally:
+        reset_hermes_home_override(token)
+
+    if not acknowledged:
+        assert result is None
+        assert not schedule_env
+    else:
+        assert result["attempt"] == 1
+        (_, kwargs), = schedule_env
+        assert kwargs["completion_delegation_id"] == delegation_id
+        assert kwargs["resolve_context_refs"] is False

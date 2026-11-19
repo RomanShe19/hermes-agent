@@ -116,7 +116,7 @@ def _update(home: Path | str, session_key: str, mutate, what: str) -> None:
 
 def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attempts: int = 0,
                       auto_continue: bool = True, notification_category: str | None = None,
-                      resolve_context_refs: bool = True) -> None:
+                      resolve_context_refs: bool = True, delegation_id: str | None = None) -> None:
     """Persist the marker for a turn that is about to run. ``attempts`` = how many auto-continues led to
     this run (0 for a user-initiated turn); the crash-loop breaker reads it back on the next resume."""
     if not session_key or not prompt:
@@ -128,6 +128,8 @@ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attemp
         entry["resolve_context_refs"] = False
     if notification_category == "diagnostic":
         entry["notification_category"] = notification_category
+    if delegation_id:
+        entry["delegation_id"] = delegation_id
     # Identity only — never the prompt: this log is read on crash triage and must not carry turn content.
     logger.debug("turn marker recorded for session %s by writer pid %s", session_key, entry["writer_pid"])
     _update(home, session_key, lambda entries: {**_prune(entries, now), session_key: entry}, "record")
@@ -145,7 +147,7 @@ def clear_turn_marker(home: Path | str, session_key: str, *, expected: dict[str,
         if expected is not None and (
             _started_at(current) != expected["started_at"]
             or any(current.get(key) != expected.get(key)
-                   for key in ("writer_pid", "writer_start_time", "prompt"))
+                   for key in ("writer_pid", "writer_start_time", "prompt", "delegation_id"))
         ):
             return None
         del entries[session_key]
@@ -167,7 +169,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
         return {"attempts": max(0, int(entry.get("attempts") or 0)), "prompt": prompt, "started_at": _started_at(entry),
                 "auto_continue": bool(entry.get("auto_continue", True)),
                 # Writer identity when present: extra keys only, so a marker written by an older build still reads.
-                **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
+                **{k: entry[k] for k in ("writer_pid", "writer_start_time", "delegation_id") if entry.get(k) is not None},
                 **({"resolve_context_refs": False} if entry.get("resolve_context_refs") is False else {}),
                 **({"notification_category": "diagnostic"}
                    if entry.get("notification_category") == "diagnostic" else {})}
