@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # The delegate_tool_* siblings hold the pieces split out of this module; every name callers or patching tests reach as
 # ``tools.delegate_tool.<name>`` is re-imported here. Mutable flag globals live only in their owning module.
 from tools.delegate_tool_child_run import (
-    _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _close_child, _detach_child,
+    _ChildRun, _attach_child, _build_child_goal_message, _build_result_entry, _close_unstarted_child,
     _dump_subagent_timeout_diagnostic, _fabricated_entry,
     _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
 )
@@ -591,10 +591,7 @@ def delegate_task(
             for i in range(len(task_list))
         ]
         for i, _, child in children:
-            _detach_child(parent_agent, child)
-            _safe_progress(getattr(child, "tool_progress_callback", None), "subagent.complete",
-                           status="failed", preview=results[i]["error"])
-            _close_child(child, "Failed to close child after delegation preflight failure")
+            _close_unstarted_child(parent_agent, child, "failed", results[i]["error"])
         _fire_subagent_stop_hooks(results[:len(children)], {i: child for i, _, child in children}, parent_agent)
         for entry, writer in zip(results, live_writers):
             if writer is not None:

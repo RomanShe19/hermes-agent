@@ -92,6 +92,14 @@ def _detach_child(parent_agent: Any, child: Any) -> None:
     except (ValueError, UnboundLocalError) as e:
         logger.debug("Could not remove child from active_children: %s", e)
 
+def _close_unstarted_child(parent_agent: Any, child: Any, status: str, reason: str) -> None:
+    """Close a built child whose worker never started and settle its queued card."""
+    _detach_child(parent_agent, child)
+    _safe_progress(getattr(child, "tool_progress_callback", None), "subagent.complete",
+                   status=status, preview=reason)
+    _close_child(child, "Failed to close unstarted delegation child")
+
+
 def _signal_child_stop(child: Any, *reason: str, tool_reason: str = "parent delegation ended") -> None:
     """Cooperative interrupt so the child's worker thread can exit cleanly. ``tool_reason`` is the
     fixed cause the child's tools see (a pending approval wait reports it instead of a user deny)."""

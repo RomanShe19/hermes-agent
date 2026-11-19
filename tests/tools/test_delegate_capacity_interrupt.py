@@ -88,7 +88,7 @@ class _ControlledChild(_Parent):
         return {"api_call_count": 0}
 
     def close(self):
-        self.closed_while_running |= not self.finished.is_set()
+        self.closed_while_running |= self.started.is_set() and not self.finished.is_set()
         self.close_count += 1
         self.closed.set()
 
@@ -220,39 +220,41 @@ def test_rejected_background_child_stops_with_parent(
         if stop_timing == "during_admission":
             request_stop(stop_message)
         continue_admission.set()
-        assert child.started.wait(5)
         if stop_timing == "running":
+            assert child.started.wait(5)
             request_stop(stop_message)
-
-        assert child.stop_received.wait(5), "fallback lost parent cancellation ownership"
-        assert child.unwinding.wait(5)
-        assert child.observed_interrupt == (stop_message, stop_kind == "hard")
-        if background_child is not None:
-            assert not background_child.stop_received.is_set()
-            assert pending_child.stop_received.is_set(), "unsubmitted unit lost parent cancellation ownership"
-            assert not pending_child.started.is_set()
-        assert not outcome.done(), "dispatch returned while its child still owned resources"
-        assert child.close_count == 0
-        child.allow_finish.set()
+            assert child.stop_received.wait(5), "fallback lost parent cancellation ownership"
+            assert child.unwinding.wait(5)
+            assert child.observed_interrupt == (stop_message, stop_kind == "hard")
+            assert not outcome.done(), "dispatch returned while its child still owned resources"
+            assert child.close_count == 0
+            child.allow_finish.set()
         result = outcome.result(timeout=5)
         if background_child is None:
-            assert "SYNCHRONOUSLY" in result["note"]
+            if stop_timing == "running":
+                assert "SYNCHRONOUSLY" in result["note"]
+            else:
+                assert result["status"] == "interrupted"
+                assert "before the synchronous fallback started" in result["note"]
             assert result["results"][0]["status"] == "interrupted"
         else:
             assert result["status"] == "dispatched"
             assert result["count"] == 3
-            assert result["background_count"] == 2
+            assert result["background_count"] == 1
+            assert len(accepted_ids) == 1
             assert [unit["delegation_id"] for unit in result["units"]] == accepted_ids
-            assert [unit["task_indexes"] for unit in result["units"]] == [[0], [2]]
-            assert [entry["task_index"] for entry in result["inline_results"]] == [1]
-            assert "1 task(s) returned inline" in result["note"]
+            assert [unit["task_indexes"] for unit in result["units"]] == [[0]]
+            assert [entry["task_index"] for entry in result["inline_results"]] == [1, 2]
+            assert "2 task(s) returned inline" in result["note"]
             assert "all remaining work depends" in result["note"]
             assert "stop with a one-line status" not in result["note"]
-            assert result["inline_results"][0]["status"] == "interrupted"
+            assert all(entry["status"] == "interrupted" for entry in result["inline_results"])
             assert not background_child.stop_received.is_set()
-            assert pending_child.unwinding.wait(5)
-            assert pending_child.observed_interrupt == (stop_message, stop_kind == "hard")
-        assert child.finished.is_set()
+            assert pending_child.stop_received.is_set()
+            assert not pending_child.started.is_set()
+            assert pending_child.closed.is_set()
+        assert child.started.is_set() == (stop_timing == "running")
+        assert child.finished.is_set() == (stop_timing == "running")
         assert child.close_count == 1
         assert not child.closed_while_running
         assert parent._active_children == []
@@ -265,18 +267,65 @@ def test_rejected_background_child_stops_with_parent(
         release_occupier.set()
         if background_child is not None:
             async_delegation.interrupt_for_session(parent_session_id=parent.session_id)
-            for extra in (background_child, pending_child):
-                extra.allow_finish.set()
-                assert extra.closed.wait(5)
-                assert extra.finished.is_set()
-                assert extra.close_count == 1
-                assert not extra.closed_while_running
+            background_child.allow_finish.set()
+            assert background_child.closed.wait(5)
+            assert background_child.finished.is_set()
+            assert background_child.close_count == 1
+            assert not background_child.closed_while_running
+            assert pending_child.close_count == 1
+            assert not pending_child.closed_while_running
             completed_ids = {registry_state.get(timeout=5)["delegation_id"] for _ in accepted_ids}
             assert completed_ids == set(accepted_ids)
         if rejection == "capacity":
             completion = registry_state.get(timeout=5)
             assert completion["delegation_id"] == accepted["delegation_id"]
         assert not worker.is_alive()
+
+
+def test_stop_before_admission_does_not_start_any_worker(registry_state, monkeypatch):
+    from tools import delegate_tool_dispatch as dispatch
+
+    parent, child = _Parent(), _ControlledChild()
+    batch = _batch(parent, child)
+    parent.hard_interrupt()
+    monkeypatch.setattr(dispatch, "_dispatch_unit", lambda *args: pytest.fail("worker submitted after Stop"))
+
+    result = json.loads(_dispatch_background(batch))
+
+    assert result["status"] == "interrupted"
+    assert result["results"][0]["status"] == "interrupted"
+    assert not child.started.is_set()
+    assert child.close_count == 1
+    assert parent._active_children == []
+    assert registry_state.empty()
+
+
+def test_partial_scheduler_rejection_still_allows_following_groups_without_stop(registry_state, monkeypatch):
+    from tools import delegate_tool_config as config
+    from tools import delegate_tool_dispatch as dispatch
+
+    parent = _Parent()
+    batch = _batch(parent, _ControlledChild(), _ControlledChild(), _ControlledChild())
+    attempts = []
+
+    def schedule(unit, unit_id, slot_key, routing):
+        [index] = [i for i, _, _ in unit.children]
+        attempts.append(index)
+        if index == 1:
+            return {"status": "rejected", "reason": "scheduler_failed"}
+        return {"status": "dispatched", "delegation_id": unit_id}
+
+    monkeypatch.setattr(config, "_get_independent_completions", lambda: True)
+    monkeypatch.setattr(dispatch, "_dispatch_unit", schedule)
+    monkeypatch.setattr(dispatch, "_execute_and_aggregate",
+                        lambda unit: {"results": [{"task_index": unit.children[0][0], "status": "completed"}]})
+
+    result = json.loads(_dispatch_background(batch))
+
+    assert attempts == [0, 1, 2]
+    assert result["background_count"] == 2
+    assert [unit["task_indexes"] for unit in result["units"]] == [[0], [2]]
+    assert result["inline_results"] == [{"task_index": 1, "status": "completed"}]
 
 
 def test_accepted_background_child_keeps_registry_cancellation_ownership(registry_state):

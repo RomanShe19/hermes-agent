@@ -15,7 +15,9 @@ from typing import Any, Dict, List, Optional
 
 from hermes_cli.observability.shared_metrics_loop import begin_delegation_run, finish_delegation_unit
 from tools.async_delegation import _new_delegation_id, record_unit_child
-from tools.delegate_tool_child_run import _attach_child, _detach_child, _fabricated_entry, _signal_child_stop
+from tools.delegate_tool_child_run import (
+    _attach_child, _close_unstarted_child, _detach_child, _fabricated_entry, _signal_child_stop,
+)
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _print_completion_line, _quiet, describe_subagent_failure, format_batch_tag,
 )
@@ -187,7 +189,13 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     record (retention pruning happens on future dispatches)."""
     from tools.delegation_live_log import update_manifest_statuses
     results: list = []
-    if len(batch.children) == 1:
+    skipped = honor_parent_interrupt and getattr(batch.parent_agent, "_interrupt_requested", False) is True
+    if skipped:
+        reason = "Parent turn interrupted before the worker started."
+        for i, _, child in batch.children:
+            results.append(_fabricated_entry(i, "interrupted", reason, child))
+            _close_unstarted_child(batch.parent_agent, child, "interrupted", reason)
+    elif len(batch.children) == 1:
         results.append(batch.run_child(*batch.children[0]))
         # A one-child unit has no join to wait on, but everything after the child returns — host-owned finalize,
         # transcript, manifest, then the durable write — is still owner-lifetime: record before any of it (#116000).
@@ -208,6 +216,8 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     finish_delegation_unit(batch.task_list, results, background=not honor_parent_interrupt)
 
     combined: dict[str, Any] = {"results": results, "total_duration_seconds": total_duration}
+    if skipped:
+        combined["status"] = "interrupted"
     # Runtime truth about children's background processes, as prose the parent can't miss inside the JSON.
     from tools.process_registry_notifications import _process_accounting_lines
     process_notes = [line for entry in results for line in _process_accounting_lines(entry)]
@@ -246,7 +256,8 @@ def _run_sync_with_note(batch: _Batch, reason: str) -> str:
     """Inline fallback: run the batch now and explain why it was not detached."""
     result = _execute_and_aggregate(batch)
     if isinstance(result, dict):
-        result["note"] = _SYNC_FALLBACK_NOTES[reason]
+        result["note"] = ("The parent turn was interrupted before the synchronous fallback started."
+                          if result.get("status") == "interrupted" else _SYNC_FALLBACK_NOTES[reason])
     return json.dumps(result, ensure_ascii=False)
 
 def _resolve_async_wake_sid(origin_wake_sid: str, origin_session_history_delivery: bool = False) -> Optional[str]:
@@ -454,6 +465,11 @@ def _dispatch_background(batch: _Batch) -> str:
     inline_results: list[dict] = []
     slot_key: Optional[str] = None
     for k, unit in enumerate(units):
+        if getattr(parent_agent, "_interrupt_requested", False) is True:
+            if not dispatched:
+                return json.dumps(_execute_and_aggregate(batch), ensure_ascii=False)
+            inline_results.extend(_execute_and_aggregate(unit)["results"])
+            continue
         # One unit keeps the live-transcript directory's id so the returned delegation_id matches
         # cache/delegation/live/<id>/; several units suffix it (-1, -2, ...) and the call keeps the bare id.
         unit_id = batch.live_deleg_id if len(units) == 1 else (f"{batch.live_deleg_id}-{k + 1}" if batch.live_deleg_id else None)
