@@ -43,11 +43,11 @@ def test_diagnostic_turn_runs_but_never_echoes_on_wire(turn_env, marker_home, mo
     assert session["running"] is False
 
 
-def test_restart_preserves_diagnostic_category_through_marker(turn_env, marker_home, monkeypatch):
+def test_restart_preserves_notification_input_policy_through_marker(turn_env, marker_home, monkeypatch):
     from tui_gateway.turn_marker import read_turn_marker
     session = _session()
     server._record_turn_marker(session, "engine diagnostic",
-                               notification_category="diagnostic")
+                               notification_category="diagnostic", resolve_context_refs=False)
     marker = read_turn_marker(marker_home, "session-key")
     assert marker["notification_category"] == "diagnostic"
     calls = []
@@ -58,6 +58,7 @@ def test_restart_preserves_diagnostic_category_through_marker(turn_env, marker_h
     monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: calls.append(k))
     server._maybe_schedule_auto_continue("session", session, "session-key")
     assert calls[0]["display_metadata"]["notification_category"] == "diagnostic"
+    assert calls[0]["resolve_context_refs"] is False
 
 
 def test_next_human_followup_is_outside_diagnostic_presentation_scope(turn_env, marker_home, monkeypatch):
@@ -76,3 +77,38 @@ def test_next_human_followup_is_outside_diagnostic_presentation_scope(turn_env, 
                               display_metadata={"notification_category": "diagnostic"})
     finals = [f["params"]["payload"]["text"] for f in frames if f.get("params", {}).get("type") == "message.complete"]
     assert finals == ["next requested result"]
+
+def test_delegation_completion_reference_is_literal(turn_env, marker_home, monkeypatch):
+    from agent import context_references
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import async_delegation as ledger
+
+    invoked = []
+    references = []
+
+    def refuse_reference(text, **kwargs):
+        references.append(text)
+        return SimpleNamespace(blocked=True, warnings=["Context injection refused."])
+
+    def run(text, **kwargs):
+        invoked.append(text)
+        return {"final_response": "processed"}
+
+    monkeypatch.setattr(context_references, "preprocess_context_references", refuse_reference)
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+    session = _session(agent=SimpleNamespace(session_id="session-key", run_conversation=run,
+                                            clear_interrupt=lambda: None), running=True)
+    event = {"type": "async_delegation", "delegation_id": "literal-reference",
+             "session_key": "session-key", "status": "completed", "dispatched_at": 1.0}
+    text = "Worker result includes the literal @diff"
+    token = set_hermes_home_override(str(marker_home))
+    try:
+        ledger._persist_dispatch(event)
+        ledger._persist_completion(event, {"status": "completed", "summary": text})
+        assert server._notif_dispatch_event("sid", session, event, text)
+        assert ledger.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+    finally:
+        reset_hermes_home_override(token)
+
+    assert not references
+    assert len(invoked) == 1 and text in invoked[0]

@@ -176,7 +176,8 @@ def _admit_prompt_turn(
 
 def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
                         notification_category: str | None = None,
-                        recovery_marker: tuple[str, int] | None = None) -> str:
+                        recovery_marker: tuple[str, int] | None = None,
+                        resolve_context_refs: bool = True) -> str:
     """Write the durable crash marker; returns the session key it was written under (compression
     can rotate session_key mid-turn).  A surviving marker means the process died mid-turn.
     The key is published before the disk write so an interrupt racing startup can retire
@@ -188,7 +189,7 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
         with session["history_lock"]:
             session["_active_turn_marker_key"] = marker_key
         record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
-                          auto_continue=auto_continue,
+                          auto_continue=auto_continue, resolve_context_refs=resolve_context_refs,
                           **({"notification_category": "diagnostic"}
                              if notification_category == "diagnostic" else {}))
         with session["history_lock"]:
@@ -647,7 +648,8 @@ def _stage_first_contact_onboarding_note(session: dict, agent, history_empty: bo
         logger.debug("first-contact onboarding note failed", exc_info=True)
 
 
-def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
+def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str],
+                        resolve_context_refs: bool = True):
     """Bind scopes, sync the agent, snapshot history, build the run message; returns
     ``(prompt, run_message, cols, streamer)`` or None when @-expansion was refused.
     Scopes fill field by field so a failure midway still leaves every bound token for the
@@ -696,7 +698,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     cols = session.get("cols", 80)
     streamer = make_stream_renderer(cols)
     prompt = text
-    if isinstance(prompt, str) and "@" in prompt:
+    if resolve_context_refs and isinstance(prompt, str) and "@" in prompt:
         from agent.context_references import preprocess_context_references
         from agent.model_metadata import get_model_context_length
         ctx_len = get_model_context_length(
@@ -1115,7 +1117,8 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     turn_author: dict | None = None,
-    recovery_marker: tuple[str, int] | None = None) -> bool:
+    recovery_marker: tuple[str, int] | None = None,
+    resolve_context_refs: bool = True) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1146,7 +1149,7 @@ def _run_prompt_submit(
             receipt_committed=terminal_callback is None)
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
             notification_category=(display_metadata or {}).get("notification_category"),
-            recovery_marker=recovery_marker)
+            recovery_marker=recovery_marker, resolve_context_refs=resolve_context_refs)
         goal_followup = None
         _turn_started_monotonic = time.monotonic()
         try:
@@ -1166,7 +1169,7 @@ def _run_prompt_submit(
                 if display_kind == "auto_continue":
                     _emit("status.update", sid, {"kind": "process", "text": "Resuming interrupted turn…"})
                 _emit("message.start", sid)
-            prepared = _prepare_turn_input(sid, session, st, text, images)
+            prepared = _prepare_turn_input(sid, session, st, text, images, resolve_context_refs)
             if prepared is None:
                 if st.terminal_callback is not None and not st.receipt_attempted:
                     st.receipt_attempted = True

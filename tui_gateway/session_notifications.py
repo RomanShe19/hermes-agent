@@ -535,7 +535,7 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
     try:
         started = _notif_submit(
             f"__notif__{int(time.time() * 1000)}", sid, session, text,
-            "notification poller dispatch failed", **kwargs)
+            "notification poller dispatch failed", resolve_context_refs=False, **kwargs)
     except Exception:
         release_event_delivery(evt, claim)
         return False
@@ -667,6 +667,7 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
             started = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
                                     "completion batch dispatch failed",
                                     display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
+                                    resolve_context_refs=False,
                                     display_metadata={"display_text": display_text})
         except Exception:
             started = False

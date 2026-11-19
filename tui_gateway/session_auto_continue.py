@@ -126,6 +126,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 started = _run_prompt_submit(
                     rid, sid, session, text, display_kind="auto_continue",
                     recovery_marker=(marker["prompt"], attempt),
+                    resolve_context_refs=marker.get("resolve_context_refs", True),
                     **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
         except Exception as exc:
             _notif_log_failure("auto-continue dispatch failed", exc)
