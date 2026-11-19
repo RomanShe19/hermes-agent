@@ -175,7 +175,10 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
             (record["delegation_id"], record.get("session_key", ""), record.get("origin_ui_session_id", ""),
              record.get("parent_session_id"), record["dispatched_at"], now, os.getpid(), owner_started_at,
              json.dumps(task_payload), record.get("origin_session_id", "")))
-    _prune_durable_records()
+    try:
+        _prune_durable_records()
+    except Exception:
+        logger.warning("Could not prune old async delegation records", exc_info=True)
 
 
 def _prune_durable_records() -> None:
@@ -825,10 +828,6 @@ def _dispatch_admitted(
             return {"status": "rejected", "reason": "at_capacity", "error": capacity_error}
         _records[delegation_id] = record
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
-    _persist_dispatch(record)
-    # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
-    # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
-    executor = _get_executor(max(max_async_children, live_units))
 
     def _worker() -> None:
         result: dict[str, Any] = {}
@@ -849,20 +848,32 @@ def _dispatch_admitted(
 
     from hermes_cli.backend_retirement import retirement
 
-    # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
-    # reservation too: the stall monitor may finalize its registry record before it really exits.
-    retirement.acquire()
+    persisted = reservation = False
     try:
+        _persist_dispatch(record)
+        persisted = True
+        # Grouped units share a slot. Size the executor for units so a sibling does not wait
+        # for the prior unit to finish before it can start.
+        executor = _get_executor(max(max_async_children, live_units))
+        # Keep admission reserved until the worker exits, even if the stall monitor finalizes it.
+        reservation = retirement.acquire()
+        if not reservation:
+            raise RuntimeError("backend is retiring")
         future = executor.submit(propagate_context_to_thread(_worker))
-        future.add_done_callback(lambda _: retirement.release())
-    except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        retirement.release()
+    except Exception as exc:
+        if reservation:
+            retirement.release()
         with _records_lock:
             _records.pop(delegation_id, None)
-        with _DB_LOCK, _transaction() as conn:
-            conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+        if persisted:
+            try:
+                with _DB_LOCK, _transaction() as conn:
+                    conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+            except Exception:
+                logger.warning("Could not remove rejected async delegation %s", delegation_id, exc_info=True)
         return {"status": "rejected", "reason": "scheduler_failed",
                 "error": f"Failed to schedule async delegation{label}: {exc}"}
+    future.add_done_callback(lambda _: retirement.release())
     if progress_fn is not None:
         _ensure_stale_monitor()
     return {"status": "dispatched", "delegation_id": delegation_id}

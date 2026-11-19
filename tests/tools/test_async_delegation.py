@@ -1290,3 +1290,33 @@ def test_first_drain_does_not_duplicate_a_live_delegation_completion(tmp_path, m
     drained = process_registry.drain_notifications(session_key="owner")
     assert [payload["delegation_id"] for payload, _ in drained] == [handle["delegation_id"]]
     assert not drained[0][0].get("restored")
+
+
+@pytest.mark.parametrize("start_step", ["_persist_dispatch", "_get_executor"])
+def test_failed_dispatch_releases_slot_for_next_worker(monkeypatch, start_step):
+    runs = []
+
+    def dispatch():
+        return ad.dispatch_async_delegation(
+            goal="verify", context=None, toolsets=None, role="leaf", model=None,
+            session_key="", runner=lambda: runs.append("started") or {"status": "completed"},
+            max_async_children=1,
+        )
+
+    def fail(*args):
+        raise RuntimeError("local dispatch startup failed")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(ad, start_step, fail)
+        rejected = dispatch()
+        assert rejected["status"] == "rejected"
+        assert rejected["reason"] == "scheduler_failed"
+        assert ad.active_count() == 0 and not runs
+        with ad._DB_LOCK, ad._transaction() as conn:
+            assert conn.execute("SELECT count(*) FROM async_delegations").fetchone()[0] == 0
+
+    next_handle = dispatch()
+    assert next_handle["status"] == "dispatched"
+    event = _drain_for(next_handle["delegation_id"])
+    assert event and event["status"] == "completed"
+    assert runs == ["started"]
