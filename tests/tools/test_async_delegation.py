@@ -788,6 +788,33 @@ def test_single_task_no_banner_when_clean():
     assert "TRUNCATED" not in text
 
 
+def test_group_completion_reports_worker_evidence_without_directing_parent_to_stop():
+    evt = _make_async_evt(
+        is_batch=True,
+        group="backup",
+        goals=["backup", "restore"],
+        results=[{"task_index": 0, "status": "completed", "summary": "backup saved"}],
+    )
+    text = format_process_notification(evt)
+    assert "backup saved" in text
+    assert "Any other units from the same delegate_task call report separately" in text
+    assert "end your turn" not in text
+
+
+@pytest.mark.parametrize("early_notice", [False, True])
+def test_group_failure_notices_keep_the_typed_reason(early_notice):
+    evt = _make_async_evt(
+        is_batch=True,
+        task_failure_notice=early_notice,
+        goals=["backup", "restore"],
+        results=[{"task_index": 0, "status": "failed", "error": "provider rejected request",
+                  "failure_reason": "rate_limit"}],
+    )
+    text = format_process_notification(evt)
+    assert "provider rejected request" in text
+    assert "failure_reason=rate_limit" in text
+
+
 def test_batch_truncation_banner_marks_only_truncated_task():
     """In a batch, only the task that hit max_iterations gets the TRUNCATED
     marker; a clean sibling keeps the normal check icon."""

@@ -192,13 +192,16 @@ def _format_task_failure_notice(evt: dict, deleg_id: str) -> str:
     goals, idx, n = evt.get("goals") or [], r.get("task_index", 0), evt.get("n_tasks") or len(evt.get("goals") or [])
     goal = goals[idx] if idx < len(goals) else r.get("goal", "")
     err = str(r.get("error") or "").strip().replace("\n", " ")[:400]
+    failure_reason = r.get("failure_reason")
     lines = [
         f"[ASYNC DELEGATION TASK FAILED — {deleg_id}, task {idx + 1}/{n}]",
         "One subagent in a background fan-out you dispatched has failed while its siblings are still running. "
         "The batch's consolidated results will still arrive when the last sibling finishes; this is an early "
         "warning so you can re-dispatch or investigate now instead of then.",
         f"Task: {goal}" if goal else "",
-        f"Status: {r.get('status', '?')}   Duration: {r.get('duration_seconds', '?')}s" + (f"\nError: {err}" if err else ""),
+        f"Status: {r.get('status', '?')}   Duration: {r.get('duration_seconds', '?')}s"
+        + (f"   failure_reason={failure_reason}" if failure_reason else "")
+        + (f"\nError: {err}" if err else ""),
     ]
     if r.get("live_transcript"):
         lines.append(f"Live transcript: {r['live_transcript']}")
@@ -234,8 +237,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
         f"A background fan-out unit you dispatched earlier — {unit} — has finished; its consolidated results are "
         "below. Any other units from the same delegate_task call report separately as they finish. You may have "
-        "moved on since dispatching — act on these or re-dispatch if things have changed. If you are still waiting "
-        "on siblings, end your turn after acting on this one.",
+        "moved on since dispatching — act on these or re-dispatch if things have changed.",
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
     lines += _recovery_lines(evt)
@@ -252,6 +254,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         schema_invalid = r.get("schema_valid") is False
         icon = "⚠" if r_truncated or (r_status in _DONE and schema_invalid) else ("✓" if r_status in _DONE else "✗")
         header = (f"--- {icon} TASK {idx + 1}/{n}" + (f": {r_goal}" if r_goal else "") + f"  (status={r_status}"
+                  + (f", failure_reason={r['failure_reason']}" if r.get("failure_reason") else "")
                   + (f", api_calls={r['api_calls']}" if r.get("api_calls") else "")
                   + (f", {r['duration_seconds']}s" if r.get("duration_seconds") is not None else "")
                   + (", TRUNCATED: hit max_iterations — work may be incomplete" if r_truncated else "")
