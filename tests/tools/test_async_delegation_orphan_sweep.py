@@ -123,6 +123,46 @@ def test_orphaned_terminal_completion_is_offered_once_while_the_process_runs(tmp
     assert _row(home, delegation_id)["delivery_state"] == "delivered"
 
 
+@pytest.mark.parametrize("concurrent_completion", [False, True])
+def test_recovery_hints_do_not_block_or_overwrite_a_writer(tmp_path, monkeypatch, concurrent_completion):
+    from tools import async_delegation_recovery_hints as hints
+
+    home = tmp_path / "home"
+    home.mkdir()
+    delegation_ids = ["first"] if concurrent_completion else ["first", "second"]
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda pid, started: False)
+
+    def collect_hint(cwd):
+        # An independent SQLite connection represents another backend.
+        conn = sqlite3.connect(home / "state.db", timeout=0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if concurrent_completion:
+                conn.execute(
+                    "UPDATE async_delegations SET state='completed', result_json=? WHERE delegation_id=?",
+                    ('{"summary": "real result"}', "first"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return "recovery hint"
+
+    monkeypatch.setattr(hints, "git_state_hint", collect_hint)
+    with _Home(home):
+        for delegation_id in delegation_ids:
+            ad._persist_dispatch({"delegation_id": delegation_id, "dispatched_at": time.time()})
+        assert ad.recover_abandoned_delegations() == (0 if concurrent_completion else 2)
+
+    for delegation_id in delegation_ids:
+        row = _row(home, delegation_id)
+        if concurrent_completion:
+            assert row["state"] == "completed"
+            assert row["result_json"] == '{"summary": "real result"}'
+        else:
+            assert row["state"] == "unknown"
+            assert "recovery hint" in row["event_json"]
+
+
 def test_row_owned_by_a_live_process_is_never_swept(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
