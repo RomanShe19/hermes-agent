@@ -414,6 +414,7 @@ def _units_of(batch: _Batch) -> list[_Batch]:
 def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str], routing: dict) -> dict:
     """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
     from tools.async_delegation import dispatch_async_delegation_batch
+    from tools.delegation_live_log import _redact
     child_agents = [c for (_, _, c) in unit.children]
 
     def _interrupt():
@@ -431,6 +432,9 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         # Persist each indexed locator before its worker starts.
         task_transcripts={str(i): path for i, _, _ in unit.children
                           if i < len(unit.live_paths) and (path := unit.live_paths[i])},
+        task_contexts={str(i): _redact(context) for i, task, _ in unit.children
+                       if isinstance(context := task.get("context"), str)
+                       and context.strip() and context != unit.context},
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
     )
 

@@ -603,3 +603,55 @@ def test_child_preflight_failure_closes_unstarted_siblings_and_finalizes_logs(mo
     assert [task["status"] for task in manifest["tasks"]] == ["rejected", "error", "rejected"]
     assert manifest["completed"]
     assert "end status=error" in (manifest_path.parent / "task-1.log").read_text(encoding="utf-8")
+
+
+def test_group_completion_keeps_only_its_owned_task_context_after_replay(monkeypatch):
+    import queue
+    from dataclasses import replace
+    from tools import async_delegation as ledger, delegate_tool as dt
+    from tools.delegate_tool_dispatch import _dispatch_unit
+    from tools.process_registry import process_registry
+    from tools.process_registry_notifications import format_process_notification
+
+    batches = []
+    monkeypatch.setattr(dt, "_run_batch", lambda batch, background: batches.append(batch) or "{}")
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kwargs: MagicMock())
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *args: _CREDS)
+    monkeypatch.setattr(dt, "_run_single_child", _fake_run)
+    events = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", events)
+    ledger._reset_for_tests()
+
+    protected_context = "Verify backup only. Do not modify the other owner's container."
+    unrelated_context = "Review the format of the unrelated report."
+    dt.delegate_task(
+        context="Release verification.",
+        tasks=[{"goal": "Verify the source backup", "context": f"{protected_context} {_BEARER}"},
+               {"goal": "Review the report format", "context": unrelated_context}],
+        parent_agent=_make_parent(), background=True,
+    )
+    [batch] = batches
+    unit = replace(batch, children=batch.children[:1], group="backup")
+    try:
+        receipt = _dispatch_unit(unit, "deleg-context", None, {
+            "session_key": "owner-session", "origin_ui_session_id": "owner-ui", "origin_session_id": "owner-durable",
+            "parent_session_id": "owner-agent", "max_async_children": 1,
+        })
+        assert receipt["status"] == "dispatched"
+        live = events.get(timeout=5)
+        assert live["delegation_id"] == receipt["delegation_id"]
+        assert set(live["task_contexts"]) == {"0"}
+        assert protected_context in live["task_contexts"]["0"]
+        assert _BEARER not in live["task_contexts"]["0"]
+
+        ledger.return_completion_offer(live)
+        assert ledger.restore_undelivered_completions(events) == 1
+        replay = events.get(timeout=5)
+        assert replay["restored"] is True
+        text = format_process_notification(replay)
+        assert "Release verification." in text
+        assert protected_context in text
+        assert unrelated_context not in text
+        assert _BEARER not in text
+    finally:
+        ledger._reset_for_tests()

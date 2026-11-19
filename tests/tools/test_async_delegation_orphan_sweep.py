@@ -163,6 +163,29 @@ def test_recovery_hints_do_not_block_or_overwrite_a_writer(tmp_path, monkeypatch
             assert "recovery hint" in row["event_json"]
 
 
+def test_owner_exit_preserves_dispatch_context_without_a_child_result(tmp_path, monkeypatch):
+    from tools.process_registry_notifications import format_process_notification
+
+    home = tmp_path / "home"
+    home.mkdir()
+    task_context = "Restore only into the isolated rehearsal directory."
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda pid, start: False)
+    q = queue.Queue()
+    with _Home(home):
+        ad._persist_dispatch({
+            "delegation_id": "no-terminal-result", "dispatched_at": time.time(), "is_batch": True,
+            "goals": ["Check the backup", "Rehearse restore"], "task_indexes": [1],
+            "task_contexts": {"1": task_context},
+        })
+        assert ad.restore_undelivered_completions(q) == 1
+
+    event = q.get_nowait()
+    assert event["status"] == "unknown"
+    assert event["restored"] is True
+    assert not event.get("results")
+    assert f"Original context for task 2: {task_context}" in format_process_notification(event)
+
+
 def test_settled_history_limit_keeps_pending_results_available_for_replay(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()

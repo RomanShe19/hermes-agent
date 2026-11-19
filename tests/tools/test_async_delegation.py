@@ -812,10 +812,14 @@ def test_group_failure_notices_keep_the_typed_reason(early_notice):
         goals=["backup", "restore"],
         results=[{"task_index": 0, "status": "failed", "error": "provider rejected request",
                   "failure_reason": "rate_limit"}],
+        task_contexts={"0": "Verify the backup only.", "1": "Restore into staging."},
     )
     text = format_process_notification(evt)
     assert "provider rejected request" in text
     assert "failure_reason=rate_limit" in text
+    assert "Verify the backup only." in text
+    if early_notice:
+        assert "Restore into staging." not in text
 
 
 @pytest.mark.parametrize(

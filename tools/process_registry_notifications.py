@@ -214,6 +214,9 @@ def _format_task_failure_notice(evt: dict, deleg_id: str) -> str:
         + (f"   failure_reason={failure_reason}" if failure_reason else "")
         + (f"\nError: {err}" if err else ""),
     ]
+    contexts = evt.get("task_contexts")
+    if isinstance(contexts, dict) and (context := contexts.get(str(idx))):
+        lines.append(f"Original task context: {context}")
     if r.get("live_transcript"):
         lines.append(f"Live transcript: {r['live_transcript']}")
     return "\n".join(line for line in lines if line)
@@ -258,6 +261,11 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     lines += [f"Unit status: {status}"]
     if len(results) != expected:
         lines.append(f"Child results returned: {len(results)}/{expected}.")
+    contexts = evt.get("task_contexts")
+    if isinstance(contexts, dict):
+        lines.extend(f"Original context for task {int(index) + 1}: {context}"
+                     for index, context in contexts.items()
+                     if isinstance(index, str) and index.isdecimal() and isinstance(context, str) and context)
     lines += _recovery_lines(evt)
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {evt['error']}"]
