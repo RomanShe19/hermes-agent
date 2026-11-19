@@ -163,6 +163,34 @@ def test_recovery_hints_do_not_block_or_overwrite_a_writer(tmp_path, monkeypatch
             assert "recovery hint" in row["event_json"]
 
 
+def test_settled_history_limit_keeps_pending_results_available_for_replay(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 1)
+    monkeypatch.setattr(ad, "_MAX_DURABLE_PENDING", 2)
+    q = queue.Queue()
+    now = time.time()
+
+    with _Home(home):
+        for offset, delegation_id in enumerate(("settled-old", "settled-new", "pending-old", "pending-a", "pending-b")):
+            event = {"delegation_id": delegation_id, "dispatched_at": now, "completed_at": now,
+                     "type": "async_delegation", "status": "completed", "summary": delegation_id}
+            ad._persist_dispatch(event)
+            ad._persist_completion(event, {"status": "completed", "summary": delegation_id})
+            if delegation_id.startswith("settled"):
+                assert ad.claim_completion_delivery(delegation_id, "claim")
+                assert ad.complete_completion_delivery(delegation_id, "claim")
+            _set(home, delegation_id, updated_at=now - 60 + offset)
+
+        ad._prune_durable_records()
+
+        assert ad.restore_undelivered_completions(q) == 2
+        assert {evt["summary"] for evt in _drain(q)} == {"pending-a", "pending-b"}
+        assert ad.get_durable_delegation("settled-old") is None
+        assert ad.get_durable_delegation("settled-new")["delivery_state"] == "delivered"
+        assert ad.get_durable_delegation("pending-old") is None
+
+
 def test_row_owned_by_a_live_process_is_never_swept(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
