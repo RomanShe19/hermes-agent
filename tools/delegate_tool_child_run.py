@@ -483,6 +483,21 @@ class _SchemaOutcome:
     valid: Optional[bool]
     errors: list[str]
     retries: int
+    retry_failure_reason: Optional[str] = None
+
+
+def _schema_retry_stop_reason(result: dict[str, Any]) -> Optional[str]:
+    if result.get("interrupted"):
+        return "interrupted"
+    if result.get("failed") or result.get("error"):
+        reason = result.get("failure_reason")
+        return reason if isinstance(reason, str) and reason else "error"
+    if result.get("completed") is False:
+        return "max_iterations"
+    if (result.get("final_response") or "").strip() in ("", "(empty)"):
+        return "empty_response"
+    return None
+
 
 def _validate_child_output_schema(
     child: Any, result: dict[str, Any], task_index: int, child_task_id: str, relay_child_text: Any
@@ -495,12 +510,13 @@ def _validate_child_output_schema(
     from tools.delegation_output_schema import build_retry_message, validate_output
     _first_text = result.get("final_response") or ""
     _schema_valid, _schema_errors = validate_output(_first_text, _output_schema)
-    if _schema_valid or not _first_text.strip() or result.get("interrupted", False):
+    if _schema_valid or _schema_retry_stop_reason(result):
         return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 0)
 
     # Exactly one retry turn, carrying the validation errors verbatim (no
     # schema re-paste — the child already holds the contract in its context).
     _retry_result = None
+    retry_failure_reason = "empty_response"
     try:
         # Same identity as the main child turn: this runs on the parent worker's thread, and an
         # unmarked turn is misread as the dispatcher-owned worker by every HERMES_KANBAN_* gate.
@@ -511,11 +527,10 @@ def _validate_child_output_schema(
                 stream_callback=relay_child_text,
             )
     except Exception as _retry_exc:
+        retry_failure_reason = "error"
         logger.warning("Subagent %d schema-retry turn failed: %s", task_index, _retry_exc)
     if isinstance(_retry_result, dict):
-        _retry_text = _retry_result.get("final_response") or ""
-        if _retry_text.strip():
-            result["final_response"] = _retry_text
+        retry_failure_reason = _schema_retry_stop_reason(_retry_result)
         try:
             result["api_calls"] = int(result.get("api_calls", 0) or 0) + int(_retry_result.get("api_calls", 0) or 0)
         except (TypeError, ValueError):
@@ -523,8 +538,11 @@ def _validate_child_output_schema(
         _retry_messages = _retry_result.get("messages")
         if isinstance(_retry_messages, list) and isinstance(result.get("messages"), list):
             result["messages"] = result["messages"] + _retry_messages
-        _schema_valid, _schema_errors = validate_output(_retry_text, _output_schema)
-    return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 1)
+        if retry_failure_reason is None:
+            _retry_text = _retry_result["final_response"]
+            result["final_response"] = _retry_text
+            _schema_valid, _schema_errors = validate_output(_retry_text, _output_schema)
+    return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 1, retry_failure_reason)
 
 def _build_tool_trace(messages: Any) -> list[dict[str, Any]]:
     """Tool trace from the child's conversation messages, pairing parallel
@@ -638,6 +656,8 @@ def _build_result_entry(
         entry["schema_valid"] = bool(schema.valid)
         if schema.retries:
             entry["schema_retries"] = schema.retries
+        if schema.retry_failure_reason:
+            entry["schema_retry_failure_reason"] = schema.retry_failure_reason
         if not schema.valid and schema.errors:
             entry["schema_errors"] = schema.errors
         if schema.valid is False and usable_summary:
@@ -647,6 +667,10 @@ def _build_result_entry(
                 + "; `summary` is the child's raw, UNVALIDATED final text — extract what you need from it "
                 "yourself (see schema_errors) rather than re-running the task."
             )
+            if schema.retry_failure_reason:
+                entry["schema_note"] += (
+                    f" The corrective attempt ended with {schema.retry_failure_reason}. The first answer was retained."
+                )
 
     # A steer queued after the final assistant turn had no tool batch to land
     # in; name it so the parent sees it was MISSED rather than silently absorbed.

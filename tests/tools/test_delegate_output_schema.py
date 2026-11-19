@@ -13,6 +13,8 @@ ONLY, zero code/prompt text copied (proprietary).
 """
 
 import json
+
+import pytest
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -140,6 +142,8 @@ class _StubChild:
     def run_conversation(self, user_message, task_id=None, **_kwargs):
         self.calls.append(user_message)
         text = self.responses.pop(0)
+        if isinstance(text, dict):
+            return {"api_calls": 1, "messages": [], **text}
         return {
             "final_response": text,
             "completed": True,
@@ -184,6 +188,50 @@ class TestRunSingleChildSchemaValidation:
         assert "rejected" in child.calls[1] or "JSON" in child.calls[1]
         # final summary is the retried (valid) answer
         assert json.loads(entry["summary"])["city"] == "Oslo"
+
+    @pytest.mark.parametrize("first", [
+        {"failed": True, "error": "rate limited", "failure_reason": "rate_limit"},
+        {"completed": False},
+    ])
+    def test_terminal_first_attempt_does_not_retry_schema(self, first):
+        child = _StubChild([
+            {"final_response": "useful partial result", **first},
+            '{"city": "Oslo"}',
+        ])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+
+        entry = _run(child)
+
+        assert len(child.calls) == 1
+        assert entry["api_calls"] == 1
+        assert entry["schema_valid"] is False
+        assert "useful partial result" in entry["summary"]
+        if first.get("failed"):
+            assert entry["status"] == "failed"
+            assert entry["failure_reason"] == "rate_limit"
+        else:
+            assert entry["truncated"] is True
+
+    @pytest.mark.parametrize(("retry", "reason"), [
+        ({"failed": True, "error": "provider rejected", "failure_reason": "rate_limit"}, "rate_limit"),
+        ({"interrupted": True}, "interrupted"),
+        ({"completed": False}, "max_iterations"),
+        ({"final_response": ""}, "empty_response"),
+    ])
+    def test_unsuccessful_schema_retry_preserves_first_answer(self, retry, reason):
+        child = _StubChild([
+            "useful first answer",
+            {"final_response": '{"city": "Oslo"}', **retry},
+        ])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+
+        entry = _run(child)
+
+        assert len(child.calls) == 2
+        assert entry["api_calls"] == 2
+        assert entry["schema_valid"] is False
+        assert entry["schema_retry_failure_reason"] == reason
+        assert "useful first answer" in entry["summary"]
 
     def test_invalid_twice_surfaces_errors_and_stops(self):
         child = _StubChild(["nope", "still nope"])
