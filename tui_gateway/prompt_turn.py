@@ -175,15 +175,15 @@ def _admit_prompt_turn(
 
 
 def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
-                        notification_category: str | None = None) -> str:
+                        notification_category: str | None = None,
+                        recovery_marker: tuple[str, int] | None = None) -> str:
     """Write the durable crash marker; returns the session key it was written under (compression
     can rotate session_key mid-turn).  A surviving marker means the process died mid-turn.
     The key is published before the disk write so an interrupt racing startup can retire
     it; the post-write cancel check closes the inverse race (Stop landed first, no file)."""
     marker_home = _session_home(session)
     marker_key = str(session.get("session_key") or "")
-    marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
-    marker_text = session.pop("_auto_continue_prompt", None) or text
+    marker_text, marker_attempt = recovery_marker if recovery_marker is not None else (text, 0)
     if isinstance(marker_text, str) and marker_text.strip():
         with session["history_lock"]:
             session["_active_turn_marker_key"] = marker_key
@@ -1114,7 +1114,8 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None) -> bool:
+    turn_author: dict | None = None,
+    recovery_marker: tuple[str, int] | None = None) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1144,7 +1145,8 @@ def _run_prompt_submit(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
-            notification_category=(display_metadata or {}).get("notification_category"))
+            notification_category=(display_metadata or {}).get("notification_category"),
+            recovery_marker=recovery_marker)
         goal_followup = None
         _turn_started_monotonic = time.monotonic()
         try:

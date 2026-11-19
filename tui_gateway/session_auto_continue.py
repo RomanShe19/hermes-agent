@@ -82,10 +82,17 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
         clear_turn_marker(home, session_key)  # stale/disabled/crash-looping: a manual message continues
         return None
-    if session.get("_auto_continue_scheduled"):
-        return None
-    session["_auto_continue_scheduled"] = True
+    reservation = object()
+    with session["history_lock"]:
+        if session.get("_auto_continue_scheduled"):
+            return None
+        session["_auto_continue_scheduled"] = reservation
     attempt, text = marker["attempts"] + 1, _auto_continue_note(marker["prompt"])
+
+    def release_schedule() -> None:
+        with session["history_lock"]:
+            if session.get("_auto_continue_scheduled") is reservation:
+                session["_auto_continue_scheduled"] = False
 
     def kickoff() -> None:
         rid = f"__auto_continue__{int(time.time() * 1000)}"
@@ -96,38 +103,41 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             logger.warning("auto-continue agent build failed for %s", sid, exc_info=True)
             err = {"error": {"message": "agent build failed"}}
         if err:  # leave the marker: the next resume retries (bounded by attempts)
-            session["_auto_continue_scheduled"] = False
+            release_schedule()
             return
         with session["history_lock"]:
+            if session.get("_auto_continue_scheduled") is not reservation:
+                return
             if session.get("running") or session.get("_turn_cancel_requested") or session.get("_finalized"):
-                session["_auto_continue_scheduled"] = False  # a real user prompt beat us; it clears the marker
+                session["_auto_continue_scheduled"] = False  # a real user prompt beat us
                 return
             session["running"] = True
             session["last_active"] = time.time()
-        # Ownership admission BEFORE message.start: a sibling backend sharing this HERMES_HOME may have written the
-        # marker and still be mid-turn. Leave the marker so a later resume retries.
-        # Running the continuation anyway would be the double-writer this fence exists to prevent. See
-        # #94778.
+        # A sibling backend may own the session. Leave the durable marker for its owner.
         if _ensure_active_session_slot(sid, session) is not None:
             logger.info("auto-continue for %s refused: session has another live owner", session_key)
             with session["history_lock"]:
                 session["running"] = False
                 session["_auto_continue_scheduled"] = False
             return
-        with session["history_lock"]:
-            # Marker inputs read back by _run_prompt_submit: attempt count (crash breaker) and the ORIGINAL prompt (no
-            # nested notes). Set here, not at schedule time, so a bail above leaves nothing for a racing user turn.
-            session["_auto_continue_attempt"], session["_auto_continue_prompt"] = attempt, marker["prompt"]
         try:
             diagnostic = marker.get("notification_category") == "diagnostic"
             with _session_profile_runtime_scope(session):
-                _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue",
+                started = _run_prompt_submit(
+                    rid, sid, session, text, display_kind="auto_continue",
+                    recovery_marker=(marker["prompt"], attempt),
                     **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
         except Exception as exc:
             _notif_log_failure("auto-continue dispatch failed", exc)
             _notif_release_turn(session)  # rebound from session_notifications
+            release_schedule()
+        else:
+            if not started:
+                # Admission already released the turn, and the durable marker was never replaced.
+                release_schedule()
+
     if _start_session_work(kickoff, name=f"auto-continue-{sid}") is None:
-        session["_auto_continue_scheduled"] = False
+        release_schedule()
         return None
     logger.info("auto-continue scheduled for session %s (attempt %d, interrupted %.0fs ago, writer pid %s: %s, "
                 "reader pid %s)", session_key, attempt, age, marker.get("writer_pid"), writer_state, os.getpid())

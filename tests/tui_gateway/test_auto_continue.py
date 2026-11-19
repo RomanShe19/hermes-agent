@@ -316,19 +316,12 @@ def test_continuation_turn_records_attempt_and_original_prompt(
     agent = types.SimpleNamespace(
         session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
     )
-    session = _session(
-        agent=agent,
-        running=True,
-        _auto_continue_attempt=2,
-        _auto_continue_prompt="the original prompt",
-    )
+    session = _session(agent=agent, running=True)
 
-    server._run_prompt_submit("rid", "sid", session, server._auto_continue_note("the original prompt"))
+    server._run_prompt_submit("rid", "sid", session, server._auto_continue_note("the original prompt"),
+                              display_kind="auto_continue", recovery_marker=("the original prompt", 2))
 
     assert [(m["attempts"], m["prompt"]) for m in seen] == [(2, "the original prompt")]
-    # Consumed, so the NEXT user turn starts from a clean slate.
-    assert "_auto_continue_attempt" not in session
-    assert "_auto_continue_prompt" not in session
 
 
 def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home):
@@ -373,7 +366,7 @@ def schedule_env(monkeypatch, marker_home):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda rid, sid, session, text, **kw: submitted.append((text, kw)),
+        lambda rid, sid, session, text, **kw: submitted.append((text, kw)) or True,
     )
     return submitted
 
@@ -387,11 +380,11 @@ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
     assert result is not None
     assert result["attempt"] == 1
     assert session["running"] is True
-    assert session["_auto_continue_attempt"] == 1
     (text, kwargs), = schedule_env
     assert text.startswith("[System note: Your previous turn was interrupted")
     assert "fix the flaky test" in text
     assert kwargs["display_kind"] == "auto_continue"
+    assert kwargs["recovery_marker"] == ("fix the flaky test", 1)
     assert not any(kind in ("status.update", "message.start") for kind, _, _ in emits)
 
 
@@ -418,6 +411,48 @@ def test_recovery_announces_only_an_admitted_turn(emits, turn_env, marker_home, 
     assert len(notices) == expected
     assert events.count("message.complete") == expected
     assert (read_turn_marker(marker_home, "session-key") is not None) is closing
+
+
+def test_refused_recovery_can_retry_without_leaking_its_marker(emits, turn_env, marker_home, monkeypatch):
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_auto_continue_config", lambda: (True, 3600, 2))
+    start_work = server._start_session_work
+
+    def refuse_turn_start(target, *, name, session=None):
+        if session is None:
+            return start_work(target, name=name)
+        return None
+
+    seen = []
+
+    def run(message, **kwargs):
+        seen.append(read_turn_marker(marker_home, "session-key"))
+        return {"final_response": "done"}
+
+    agent = types.SimpleNamespace(session_id="session-key", run_conversation=run,
+                                  clear_interrupt=lambda: None)
+    session = _session(agent=agent)
+    record_turn_start(marker_home, "session-key", "finish interrupted work", attempts=1)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(server, "_start_session_work", refuse_turn_start)
+        server._maybe_schedule_auto_continue("sid", session, "session-key")
+
+    assert not session.get("_auto_continue_scheduled")
+    assert session["running"] is False
+    assert read_turn_marker(marker_home, "session-key")["attempts"] == 1
+    assert seen == []
+
+    session["running"] = True
+    assert server._run_prompt_submit("rid", "sid", session, "new user prompt")
+    assert [(m["attempts"], m["prompt"]) for m in seen] == [(0, "new user prompt")]
+
+    record_turn_start(marker_home, "session-key", "finish interrupted work", attempts=1)
+    assert server._maybe_schedule_auto_continue("sid", session, "session-key") is not None
+    assert [(m["attempts"], m["prompt"]) for m in seen] == [
+        (0, "new user prompt"), (2, "finish interrupted work"),
+    ]
 
 
 def test_hosted_room_marker_is_left_to_the_driver(schedule_env, marker_home):
@@ -506,9 +541,6 @@ def test_running_session_wins_over_continuation(emits, schedule_env, marker_home
     assert not schedule_env
     assert session["_auto_continue_scheduled"] is False
     assert read_turn_marker(marker_home, "session-key") is not None
-    # Nothing left behind for the racing user turn to inherit.
-    assert "_auto_continue_attempt" not in session
-    assert "_auto_continue_prompt" not in session
 
 
 def test_double_schedule_is_guarded(emits, schedule_env, marker_home):
