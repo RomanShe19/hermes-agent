@@ -40,6 +40,20 @@ def test_a_failed_single_delegation_is_listed_for_its_session():
         "completed_at": pytest.approx(time.time(), abs=30)}]
 
 
+def test_successes_do_not_count_against_the_failed_task_limit():
+    now = time.time()
+    _delegation("older-error", status="error", completed_at=now - 4,
+                result={"status": "error", "error": "older failure"})
+    _delegation("newer-error", status="completed", completed_at=now - 3, is_batch=True,
+                result={"results": [{"task_index": 0, "status": "error", "error": "newer failure"}]})
+    for i in (2, 1):
+        _delegation(f"success-{i}", status="completed", completed_at=now - i,
+                    result={"status": "completed", "summary": "done"})
+
+    [failure] = ad.failed_delegations_for_session("ui-1", limit=1, now=now)
+    assert (failure["delegation_id"], failure["error"]) == ("newer-error", "newer failure")
+
+
 def test_a_batch_that_completed_still_surfaces_its_failed_task():
     _delegation("d-batch", status="completed", is_batch=True, goals=["scan api", "scan web"], task_indexes=[3, 4],
                 result={"results": [{"task_index": 3, "status": "completed", "summary": "ok"},

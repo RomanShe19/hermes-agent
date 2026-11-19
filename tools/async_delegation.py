@@ -651,16 +651,18 @@ def failed_delegations_for_session(
     the UI session id at dispatch, or the spawner's durable session id (survives a reload re-mint)."""
     selectors = [(col, val) for col, val in (
         ("origin_ui_session_id", origin_ui_session_id), ("parent_session_id", parent_session_id)) if val]
-    if not selectors:
+    if not selectors or limit <= 0:
         return []
     cutoff = (now if now is not None else time.time()) - _FAILURE_SURFACE_WINDOW_S
     owner_sql = " OR ".join(f"{col}=?" for col, _ in selectors)
+    # A completed unit may contain failed children. Apply the limit after classifying them,
+    # using the existing ownership, retention and age bounds for the candidate rows.
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             f"""SELECT delegation_id, state, dispatched_at, completed_at, task_json, result_json FROM async_delegations
                 WHERE ({owner_sql}) AND state NOT IN ('running','finalizing') AND completed_at >= ?
-                ORDER BY completed_at DESC LIMIT ?""",
-            (*(val for _, val in selectors), cutoff, limit)).fetchall()
+                ORDER BY completed_at DESC, delegation_id DESC""",
+            (*(val for _, val in selectors), cutoff)).fetchall()
     from tools.process_registry_notifications import delegation_completion_warning
 
     failed: list[dict[str, Any]] = []
@@ -690,7 +692,9 @@ def failed_delegations_for_session(
                 "delegation_id": delegation_id, "task_index": index, "status": status,
                 "goal": str(goal_for.get(index, fallback_goal) or ""), "error": str(error) if error else None,
                 "dispatched_at": dispatched_at, "completed_at": completed_at})
-    return failed[:limit]
+            if len(failed) == limit:
+                return failed
+    return failed
 
 
 # ── In-memory registry queries ──────────────────────────────────────────────
