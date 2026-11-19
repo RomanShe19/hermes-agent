@@ -322,6 +322,66 @@ class TestRunSingleChildSchemaValidation:
         assert entry["schema_valid"] is True and len(child.calls) == 1
 
 
+    def test_schema_retry_inherits_worker_approval_policy(self, monkeypatch):
+        from tools import delegate_tool as dt
+        from tools.terminal_tool import _get_approval_callback
+
+        approval = lambda *_args, **_kwargs: False
+        seen = []
+
+        class Child(_StubChild):
+            def run_conversation(self, *args, **kwargs):
+                seen.append(_get_approval_callback())
+                return super().run_conversation(*args, **kwargs)
+
+        monkeypatch.setattr(dt, "_get_subagent_approval_callback", lambda: approval)
+        child = Child(["first invalid answer", '{"city": "Berlin"}'])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+
+        assert _run(child)["schema_valid"] is True
+        assert seen == [approval, approval]
+
+    def test_schema_retry_timeout_preserves_first_answer_and_defers_close(self, monkeypatch, tmp_path):
+        import threading
+        from tools import delegate_tool as dt
+        from tools import delegate_tool_child_run as child_run
+        from tools import subagent_worktree
+
+        release_retry = threading.Event()
+        finished_retry = threading.Event()
+        closed = threading.Event()
+
+        class Child(_StubChild):
+            def run_conversation(self, *args, **kwargs):
+                if self.calls:
+                    release_retry.wait(2)
+                    finished_retry.set()
+                return super().run_conversation(*args, **kwargs)
+
+            def close(self):
+                closed.set()
+
+        monkeypatch.setattr(dt, "_get_child_timeout", lambda: 0.25)
+        monkeypatch.setattr(child_run, "_create_isolated_worktree",
+                            lambda *args: {"path": str(tmp_path), "branch": "worker-isolation"})
+        monkeypatch.setattr(subagent_worktree, "finalize_subagent_worktree",
+                            lambda *args: pytest.fail("worktree finalized while worker still owns it"))
+        child = Child(["first useful answer", '{"city": "Berlin"}'])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        try:
+            entry = _run(child)
+            assert entry["schema_valid"] is False
+            assert entry["schema_retry_failure_reason"] == "timeout"
+            assert "first useful answer" in entry["summary"]
+            assert entry["worktree"]["inspection_failed"] is True
+            assert entry["worktree"]["pruned"] is False
+            assert not finished_retry.is_set()
+            assert not closed.is_set()
+        finally:
+            release_retry.set()
+        assert closed.wait(5)
+        assert finished_retry.is_set()
+
     def test_retry_turn_runs_in_delegated_child_context(self, monkeypatch):
         """The retry is a second run_conversation on the child, issued from the parent's
         thread where HERMES_KANBAN_TASK is set. Unwrapped it carries the worker's identity,

@@ -10,10 +10,10 @@ import os
 import threading
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from agent.compression_marker import elide
 from agent.interrupt_compat import request_hard_interrupt
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from tools import file_state
 from tools.process_registry_notifications import delegation_completion_warning
 from tools.delegate_tool_progress import _quiet, _safe_progress
@@ -500,7 +500,8 @@ def _schema_retry_stop_reason(result: dict[str, Any]) -> Optional[str]:
 
 
 def _validate_child_output_schema(
-    child: Any, result: dict[str, Any], task_index: int, child_task_id: str, relay_child_text: Any
+    child: Any, result: dict[str, Any], task_index: int, child_task_id: str, relay_child_text: Any,
+    *, on_retry: Optional[Callable[[_SchemaOutcome], None]] = None,
 ) -> _SchemaOutcome:
     """Validate the final answer against the attached output_schema with ONE bounded retry. Schema-less children (no
     dict on ``child._delegate_output_schema``) take no branch here so their result entry stays byte-identical."""
@@ -510,8 +511,11 @@ def _validate_child_output_schema(
     from tools.delegation_output_schema import build_retry_message, validate_output
     _first_text = result.get("final_response") or ""
     _schema_valid, _schema_errors = validate_output(_first_text, _output_schema)
-    if _schema_valid or _schema_retry_stop_reason(result):
-        return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 0)
+    initial = _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 0)
+    if _schema_valid or _schema_retry_stop_reason(result) or getattr(child, "_interrupt_requested", False) is True:
+        return initial
+    if on_retry is not None:
+        on_retry(initial)
 
     # Exactly one retry turn, carrying the validation errors verbatim (no
     # schema re-paste — the child already holds the contract in its context).
@@ -762,12 +766,15 @@ class _ChildRun:
         if delta:
             _safe_progress(self.child_progress_cb, "subagent.text", preview=delta)
 
-    def attach_worktree(self, entry_dict: dict[str, Any]) -> dict[str, Any]:
+    def attach_worktree(self, entry_dict: dict[str, Any], *, worker_unwinding: bool = False) -> dict[str, Any]:
         """Inspect + prune the child worktree, reporting into the entry (no-op without isolation)."""
         info = self.worktree_info
         if info is None:
             return entry_dict
         from tools import subagent_worktree
+        if worker_unwinding:
+            entry_dict["worktree"] = subagent_worktree.unproven_worktree_payload(info, "worker still unwinding")
+            return entry_dict
         try:
             entry_dict["worktree"] = subagent_worktree.finalize_subagent_worktree(info)
         except Exception as e:
@@ -804,7 +811,8 @@ class _ChildRun:
         self.parent_reads_snapshot = list(file_state.known_reads(self.parent_task_id)) if self.parent_task_id else []
 
     def finish_failed(
-        self, entry: dict[str, Any], late_steer: Optional[str], *, preview: str, summary: str = "", status: Optional[str] = None,
+        self, entry: dict[str, Any], late_steer: Optional[str], *, preview: str, summary: str = "",
+        status: Optional[str] = None, worker_unwinding: bool = False,
     ) -> dict[str, Any]:
         """Shared tail of every failure path: emit ``subagent.complete`` (``status`` defaults to the entry's), note
         the steer text that won the race with the failure, report the worktree."""
@@ -813,7 +821,7 @@ class _ChildRun:
             duration_seconds=entry["duration_seconds"], summary=summary,
         )
         _append_missed_steer(entry, late_steer)
-        return self.attach_worktree(entry)
+        return self.attach_worktree(entry, worker_unwinding=worker_unwinding)
 
     def close_steering(self) -> Optional[str]:
         """Close steer acceptance (see ``_merge_late_steer``); returns late steer text, if any."""
@@ -857,9 +865,13 @@ class _ChildRun:
                 warned = True
                 _warn_child_budget(self.child, child_timeout - (deadline - time.monotonic()), child_timeout)
 
-    def await_child(self) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], bool]:
-        """Run the child's conversation on a daemon worker: ``(result, None, False)`` or ``(None, error_entry,
-        close_deferred)`` on timeout/exception.
+    def await_child(
+        self,
+    ) -> tuple[Optional[dict[str, Any]], Optional[_SchemaOutcome], Optional[dict[str, Any]], bool]:
+        """Run the initial turn and any schema retry on the same supervised daemon worker.
+
+        Return the result and schema outcome, or a failure entry if no answer was saved.
+        The final flag says whether closing remains the worker's responsibility.
 
         Hard timeout is off by default (``result(timeout=None)``; stuck children are the heartbeat's job). Daemon
         worker: an abandoned timed-out child on a non-daemon thread would block interpreter exit at atexit join. The
@@ -885,13 +897,24 @@ class _ChildRun:
         _images = list(getattr(child, "_delegate_images", None) or [])
         user_message: Any = _build_child_goal_message(self.goal, _images, child) if _images else self.goal
 
+        first_before_retry: Optional[tuple[dict[str, Any], _SchemaOutcome]] = None
+
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
+                result = child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )
+
+            def save_first_answer(schema: _SchemaOutcome) -> None:
+                nonlocal first_before_retry
+                first_before_retry = (dict(result), schema)
+
+            schema = _validate_child_output_schema(
+                child, result, task_index, self.child_task_id, self.relay_text, on_retry=save_first_answer,
+            )
+            return result, schema
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
@@ -930,8 +953,8 @@ class _ChildRun:
                     "Subagent %d settled inside the %.1fs stale-result grace window — collecting its real result",
                     task_index, grace,
                 )
-                return future.result(), None, False
-            return future.result(), None, False
+            result, schema = future.result()
+            return result, schema, None, False
         except Exception as wait_exc:
             exc: BaseException = wait_exc  # ``as`` targets are unbound after the except block
         finally:
@@ -981,6 +1004,18 @@ class _ChildRun:
         if diagnostic_path:
             _err += f" Diagnostic: {diagnostic_path}"
         status = "timeout" if is_timeout else "error"
+        close_deferred = is_timeout and not future.done()
+        if close_deferred:
+            _defer_close_after_timeout(child, future)
+        if first_before_retry is not None:
+            result, schema = first_before_retry
+            if _late_pending_steer:
+                pending = result.get("pending_steer")
+                result["pending_steer"] = (
+                    f"{pending}\n{_late_pending_steer}" if isinstance(pending, str) and pending else _late_pending_steer
+                )
+            return result, replace(schema, retries=1, retry_failure_reason=status), None, close_deferred
+
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,
@@ -993,11 +1028,11 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
-        self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
-        close_deferred = is_timeout and not future.done()
-        if close_deferred:
-            _defer_close_after_timeout(child, future)
-        return None, _error_entry, close_deferred
+        self.finish_failed(
+            _error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc),
+            worker_unwinding=close_deferred,
+        )
+        return None, None, _error_entry, close_deferred
 
     def append_sibling_write_reminder(self, entry: dict[str, Any]) -> None:
         """Warn the parent when this child wrote files the parent had already read. Checks writes by ANY non-parent

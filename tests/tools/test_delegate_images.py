@@ -84,7 +84,7 @@ def test_child_run_sends_multimodal_goal_turn(tmp_path):
     with patch("tools.delegate_tool_child_run._create_isolated_worktree", return_value=None), \
             patch("agent.image_routing.decide_image_input_mode", return_value="native"):
         run.seed_workspace()
-        result, failure, _ = run.await_child()
+        result, _schema, failure, _deferred = run.await_child()
     assert failure is None and result["final_response"] == "ok"
     content = seen["user_message"]
     assert isinstance(content, list) and content[0]["type"] == "text"
