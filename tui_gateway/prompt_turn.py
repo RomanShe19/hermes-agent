@@ -1161,6 +1161,8 @@ def _run_prompt_submit(
                 sid, session.get("session_key") or "", getattr(agent, "session_id", "") or "",
                 display_kind or "user", len(text) if isinstance(text, str) else "-", len(images))
             if not muted:
+                if display_kind == "auto_continue":
+                    _emit("status.update", sid, {"kind": "process", "text": "Resuming interrupted turn…"})
                 _emit("message.start", sid)
             prepared = _prepare_turn_input(sid, session, st, text, images)
             if prepared is None:

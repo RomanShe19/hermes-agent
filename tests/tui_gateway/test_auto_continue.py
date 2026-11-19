@@ -392,7 +392,32 @@ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
     assert text.startswith("[System note: Your previous turn was interrupted")
     assert "fix the flaky test" in text
     assert kwargs["display_kind"] == "auto_continue"
-    assert ("message.start", "sid", None) in [(e, s, p) for e, s, p in emits]
+    assert not any(kind in ("status.update", "message.start") for kind, _, _ in emits)
+
+
+@pytest.mark.parametrize("closing", [False, True])
+def test_recovery_announces_only_an_admitted_turn(emits, turn_env, marker_home, monkeypatch, closing):
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_auto_continue_config", lambda: (True, 3600, 2))
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda *a, **k: {"final_response": "done"},
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, _closing=closing)
+    record_turn_start(marker_home, "session-key", "finish the interrupted work")
+
+    server._maybe_schedule_auto_continue("sid", session, "session-key")
+
+    events = [kind for kind, _, _ in emits]
+    notices = [payload for kind, _, payload in emits if kind == "status.update"
+               and payload.get("text") == "Resuming interrupted turn…"]
+    expected = 0 if closing else 1
+    assert events.count("message.start") == expected
+    assert len(notices) == expected
+    assert events.count("message.complete") == expected
+    assert (read_turn_marker(marker_home, "session-key") is not None) is closing
 
 
 def test_hosted_room_marker_is_left_to_the_driver(schedule_env, marker_home):
