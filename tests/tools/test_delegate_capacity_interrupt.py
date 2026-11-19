@@ -123,7 +123,38 @@ def registry_state(tmp_path, monkeypatch):
     async_delegation._reset_for_tests()
 
 
-@pytest.mark.parametrize("rejection", ["capacity", "schedule_failure", "partial_schedule_failure"])
+def test_full_background_pool_never_starts_a_synchronous_worker(registry_state, monkeypatch):
+    parent, child = _Parent(), _ControlledChild()
+    release_slot = threading.Event()
+    started = threading.Event()
+
+    def occupy_slot():
+        started.set()
+        release_slot.wait(10)
+        return {"status": "completed", "summary": "slot released"}
+
+    occupant = async_delegation.dispatch_async_delegation(
+        goal="occupy the shared slot", context=None, toolsets=None, role="leaf",
+        model=child.model, session_key="other-session", runner=occupy_slot, max_async_children=1,
+    )
+    assert occupant["status"] == "dispatched"
+    assert started.wait(5)
+    monkeypatch.setattr(child, "run_conversation", lambda **kwargs: pytest.fail("capacity was bypassed"))
+
+    try:
+        result = json.loads(_dispatch_background(_batch(parent, child)))
+        assert result["status"] == "rejected"
+        assert result["reason"] == "at_capacity"
+        assert [entry["status"] for entry in result["results"]] == ["rejected"]
+        assert not child.started.is_set()
+        assert child.close_count == 1
+        assert parent._active_children == []
+        assert registry_state.empty()
+    finally:
+        release_slot.set()
+
+
+@pytest.mark.parametrize("rejection", ["schedule_failure", "partial_schedule_failure"])
 @pytest.mark.parametrize("stop_timing", ["running", "during_admission"])
 @pytest.mark.parametrize("stop_kind", ["soft", "hard"])
 def test_rejected_background_child_stops_with_parent(
@@ -145,26 +176,11 @@ def test_rejected_background_child_stops_with_parent(
         batch = _batch(parent, background_child, child, pending_child)
     else:
         batch = _batch(parent, child)
-    occupied = threading.Event()
-    release_occupier = threading.Event()
     admission_started = threading.Event()
     continue_admission = threading.Event()
     outcome = Future()
 
-    def occupy_slot():
-        occupied.set()
-        assert release_occupier.wait(30)
-        return {"status": "completed", "summary": "slot released"}
-
-    if rejection == "capacity":
-        accepted = async_delegation.dispatch_async_delegation(
-            goal="occupy the only slot", context=None, toolsets=None, role="leaf",
-            model=child.model, session_key="other-session", runner=occupy_slot,
-            max_async_children=1,
-        )
-        assert accepted["status"] == "dispatched"
-        assert occupied.wait(5)
-    elif rejection == "schedule_failure":
+    if rejection == "schedule_failure":
         class RejectingExecutor:
             def submit(self, *_args, **_kwargs):
                 raise RuntimeError("executor shut down")
@@ -264,7 +280,6 @@ def test_rejected_background_child_stops_with_parent(
             child.hard_interrupt("test teardown")
         child.allow_finish.set()
         worker.join(timeout=5)
-        release_occupier.set()
         if background_child is not None:
             async_delegation.interrupt_for_session(parent_session_id=parent.session_id)
             background_child.allow_finish.set()
@@ -276,9 +291,6 @@ def test_rejected_background_child_stops_with_parent(
             assert not pending_child.closed_while_running
             completed_ids = {registry_state.get(timeout=5)["delegation_id"] for _ in accepted_ids}
             assert completed_ids == set(accepted_ids)
-        if rejection == "capacity":
-            completion = registry_state.get(timeout=5)
-            assert completion["delegation_id"] == accepted["delegation_id"]
         assert not worker.is_alive()
 
 
@@ -300,32 +312,46 @@ def test_stop_before_admission_does_not_start_any_worker(registry_state, monkeyp
     assert registry_state.empty()
 
 
-def test_partial_scheduler_rejection_still_allows_following_groups_without_stop(registry_state, monkeypatch):
+@pytest.mark.parametrize("reason", ["scheduler_failed", "at_capacity"])
+def test_partial_rejection_still_allows_following_groups_without_stop(registry_state, monkeypatch, reason):
     from tools import delegate_tool_config as config
     from tools import delegate_tool_dispatch as dispatch
 
     parent = _Parent()
-    batch = _batch(parent, _ControlledChild(), _ControlledChild(), _ControlledChild())
-    attempts = []
+    children = [_ControlledChild() for _ in range(3)]
+    batch = _batch(parent, *children)
+    attempts, inline = [], []
 
     def schedule(unit, unit_id, slot_key, routing):
         [index] = [i for i, _, _ in unit.children]
         attempts.append(index)
         if index == 1:
-            return {"status": "rejected", "reason": "scheduler_failed"}
+            return {"status": "rejected", "reason": reason, "error": f"Refused: {reason}"}
         return {"status": "dispatched", "delegation_id": unit_id}
+
+    def execute_child(self, index, task, child):
+        inline.append(index)
+        return {"task_index": index, "status": "completed"}
 
     monkeypatch.setattr(config, "_get_independent_completions", lambda: True)
     monkeypatch.setattr(dispatch, "_dispatch_unit", schedule)
-    monkeypatch.setattr(dispatch, "_execute_and_aggregate",
-                        lambda unit: {"results": [{"task_index": unit.children[0][0], "status": "completed"}]})
+    monkeypatch.setattr(_Batch, "run_child", execute_child)
 
     result = json.loads(_dispatch_background(batch))
 
     assert attempts == [0, 1, 2]
     assert result["background_count"] == 2
     assert [unit["task_indexes"] for unit in result["units"]] == [[0], [2]]
-    assert result["inline_results"] == [{"task_index": 1, "status": "completed"}]
+    [fallback] = result["inline_results"]
+    assert fallback["task_index"] == 1
+    if reason == "at_capacity":
+        assert inline == []
+        assert fallback["status"] == "rejected"
+        assert fallback["error"] == "Refused: at_capacity"
+        assert children[1].close_count == 1
+    else:
+        assert inline == [1]
+        assert fallback["status"] == "completed"
 
 
 def test_accepted_background_child_keeps_registry_cancellation_ownership(registry_state):

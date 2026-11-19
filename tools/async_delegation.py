@@ -942,9 +942,8 @@ def dispatch_async_delegation(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn,
         capacity_error=(
-            f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
-            "(its result will re-enter the chat), or run this task synchronously (background=false). "
-            "Raise delegation.max_concurrent_children in config.yaml to allow more concurrent background subagents."))
+            f"Async delegation capacity reached ({max_async_children} slots). This request was not queued. "
+            "Continue any work independent of this delegation; retry when a slot is available."))
     if handle["status"] == "dispatched":
         logger.info("Dispatched async delegation %s (session_key=%s): %s",
                     delegation_id, session_key or "<cli>", (goal or "")[:80])
@@ -978,9 +977,8 @@ def dispatch_async_delegation_batch(
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         task_indexes=task_indexes, task_transcripts=task_transcripts,
         capacity_error=(
-            f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
-            "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
-            "config.yaml to allow more concurrent background units."))
+            f"Async delegation capacity reached ({max_async_children} slots). This request was not queued. "
+            "Continue any work independent of this delegation; retry when a slot is available."))
     if handle["status"] == "dispatched":
         logger.info("Dispatched async delegation batch %s (%d task(s), session_key=%s)",
                     delegation_id, n, session_key or "<cli>")

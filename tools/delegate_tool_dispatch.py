@@ -182,19 +182,22 @@ def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interru
         executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
     results.sort(key=lambda r: r["task_index"])  # match input order
 
-def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True) -> dict:
+def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True,
+                           rejection: Optional[str] = None) -> dict:
     """Run the batch's built children, join, finalize (hooks + cost rollup), return the combined dict. Shared by the
     sync path and the background runner; a background runner receives a per-group unit (a subset of the call's
     children) so each group JOINS only on itself. Live transcripts are finalized but retained as the full-fidelity
     record (retention pruning happens on future dispatches)."""
     from tools.delegation_live_log import update_manifest_statuses
     results: list = []
-    skipped = honor_parent_interrupt and getattr(batch.parent_agent, "_interrupt_requested", False) is True
-    if skipped:
-        reason = "Parent turn interrupted before the worker started."
+    stopped = honor_parent_interrupt and getattr(batch.parent_agent, "_interrupt_requested", False) is True
+    unstarted_status = "interrupted" if stopped else "rejected" if rejection is not None else None
+    if unstarted_status is not None:
+        reason = ("Parent turn interrupted before the worker started." if stopped
+                  else rejection or "Background delegation was rejected.")
         for i, _, child in batch.children:
-            results.append(_fabricated_entry(i, "interrupted", reason, child))
-            _close_unstarted_child(batch.parent_agent, child, "interrupted", reason)
+            results.append(_fabricated_entry(i, unstarted_status, reason, child))
+            _close_unstarted_child(batch.parent_agent, child, "interrupted" if stopped else "failed", reason)
     elif len(batch.children) == 1:
         results.append(batch.run_child(*batch.children[0]))
         # A one-child unit has no join to wait on, but everything after the child returns — host-owned finalize,
@@ -216,8 +219,8 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     finish_delegation_unit(batch.task_list, results, background=not honor_parent_interrupt)
 
     combined: dict[str, Any] = {"results": results, "total_duration_seconds": total_duration}
-    if skipped:
-        combined["status"] = "interrupted"
+    if unstarted_status is not None:
+        combined["status"] = unstarted_status
     # Runtime truth about children's background processes, as prose the parent can't miss inside the JSON.
     from tools.process_registry_notifications import _process_accounting_lines
     process_notes = [line for entry in results for line in _process_accounting_lines(entry)]
@@ -236,11 +239,6 @@ _SYNC_FALLBACK_NOTES = {
         "receive a detached subagent result after the turn ends (a "
         "finite chat using -Q, --oneshot, or non-TTY stdio, `hermes -z`, a cron job, a Kanban "
         "worker, or a stateless HTTP endpoint). The subagent(s) ran SYNCHRONOUSLY and the result is included above."
-    ),
-    "at_capacity": (
-        "The background delegation pool was at capacity (delegation.max_concurrent_children), so the subagent(s) ran "
-        "SYNCHRONOUSLY and the result is included above. Raise "
-        "delegation.max_concurrent_children in config.yaml to allow more concurrent background delegations."
     ),
     "scheduler_failed": (
         "Hermes could not schedule the background delegation. The subagent(s) ran SYNCHRONOUSLY "
@@ -445,8 +443,8 @@ def _restore_parent_cancellation(unit: _Batch) -> None:
 def _dispatch_background(batch: _Batch) -> str:
     """Dispatch the call as independent async units (see ``_units_of``) and return the tool result JSON. Every unit
     of one call shares ONE pool slot (``slot_key``), so grouping never changes capacity accounting. Falls back to
-    running synchronously (with an explanatory ``note``) when the session cannot receive detached completions or the
-    async pool is at capacity."""
+    running synchronously (with an explanatory ``note``) when the session cannot receive detached completions
+    or scheduling fails. Capacity refusals leave the requested work unstarted."""
     from tools.delegate_tool import _get_max_async_children
     wake_sid = _resolve_async_wake_sid(batch.origin_wake_sid, batch.origin_session_history_delivery)
     if wake_sid is None:
@@ -484,17 +482,24 @@ def _dispatch_background(batch: _Batch) -> str:
             dispatched.append((unit, dispatch["delegation_id"]))
             continue
         _restore_parent_cancellation(unit)
+        reason = dispatch.get("reason")
+        if reason == "at_capacity":
+            rejection = dispatch["error"]
+            result = _execute_and_aggregate(unit if dispatched else batch, rejection=rejection)
+            if dispatched:
+                inline_results.extend(result["results"])
+                continue
+            if result["status"] == "rejected":
+                result.update(reason=reason, error=rejection)
+            return json.dumps(result, ensure_ascii=False)
         if not dispatched:
-            reason = dispatch.get("reason")
-            if reason not in {"at_capacity", "scheduler_failed"}:
-                reason = "dispatch_rejected"
+            reason = "scheduler_failed" if reason == "scheduler_failed" else "dispatch_rejected"
             logger.info(
                 "delegate_task: background dispatch rejected (%s); running the whole batch synchronously instead.",
                 dispatch.get("error", "rejected"),
             )
             return _run_sync_with_note(batch, reason)
-        # Later units of an admitted call share its slot and cannot be capacity-rejected; a scheduler failure runs
-        # the unit inline so no task is silently dropped.
+        # An executor failure can run inline after admission refused to schedule this unit.
         logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.", k + 1, len(units), dispatch.get("error"))
         inline_results.extend(_execute_and_aggregate(unit)["results"])
     return json.dumps(_dispatched_payload(batch, dispatched, inline_results), ensure_ascii=False)
