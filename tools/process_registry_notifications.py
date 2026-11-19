@@ -163,6 +163,17 @@ def delegation_completion_warning(entry: dict) -> str:
     return " ".join(warnings)
 
 
+def delegation_batch_status(results: list[dict], *, expected: int, error: bool = False) -> str:
+    """Classify the unit without discarding completed or partial child output."""
+    finished = [result for result in results if result.get("status") in _DONE]
+    if not finished:
+        return "error"
+    if (error or len(finished) != len(results) or len(finished) != expected
+            or any(delegation_completion_warning(result) for result in finished)):
+        return "partial"
+    return "completed"
+
+
 def _notice_lines(results) -> list[str]:
     """Blank + model_not_found notice block, or [] when the notice does not apply."""
     notice = _delegation_model_not_found_notice(results)
@@ -240,6 +251,13 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         "moved on since dispatching — act on these or re-dispatch if things have changed.",
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
+    status = evt.get("status")
+    expected = evt.get("expected_task_count", len(results))
+    if not status or status == "completed":
+        status = delegation_batch_status(results, expected=expected, error=bool(evt.get("error")))
+    lines += [f"Unit status: {status}"]
+    if len(results) != expected:
+        lines.append(f"Child results returned: {len(results)}/{expected}.")
     lines += _recovery_lines(evt)
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {evt['error']}"]

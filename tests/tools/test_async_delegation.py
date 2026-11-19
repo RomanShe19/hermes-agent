@@ -792,11 +792,14 @@ def test_group_completion_reports_worker_evidence_without_directing_parent_to_st
     evt = _make_async_evt(
         is_batch=True,
         group="backup",
-        goals=["backup", "restore"],
+        goals=["backup", "restore", "rehearsal"],
+        context="Authorized: backup → restore → rehearsal. Do not modify the other owner's container.",
         results=[{"task_index": 0, "status": "completed", "summary": "backup saved"}],
     )
     text = format_process_notification(evt)
     assert "backup saved" in text
+    assert "Authorized: backup → restore → rehearsal." in text
+    assert "Do not modify the other owner's container." in text
     assert "Any other units from the same delegate_task call report separately" in text
     assert "end your turn" not in text
 
@@ -813,6 +816,36 @@ def test_group_failure_notices_keep_the_typed_reason(early_notice):
     text = format_process_notification(evt)
     assert "provider rejected request" in text
     assert "failure_reason=rate_limit" in text
+
+
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        ([{"status": "completed"}, {"status": "completed"}], "completed"),
+        ([{"status": "completed"}, {"status": "failed"}], "partial"),
+        ([{"status": "completed"}, {"status": "completed", "exit_reason": "max_iterations"}], "partial"),
+        ([{"status": "completed"}, {"status": "completed", "schema_valid": False}], "partial"),
+        ([{"status": "completed"}], "partial"),
+        ([], "error"),
+    ],
+)
+def test_async_batch_terminal_status_matches_child_results(results, expected):
+    entries = [dict(entry, task_index=index, summary=f"child {index}") for index, entry in enumerate(results)]
+    handle = ad.dispatch_async_delegation_batch(
+        goals=["backup", "rehearse"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=lambda: {"results": entries},
+    )
+    assert handle["status"] == "dispatched"
+    evt = _drain_for(handle["delegation_id"])
+    assert evt is not None and evt["status"] == expected
+    assert evt["results"] == entries
+    stored = ad.get_durable_delegation(handle["delegation_id"])
+    assert stored["state"] == expected
+    assert stored["result"]["results"] == entries
+    text = format_process_notification(evt)
+    assert f"Unit status: {expected}" in text
+    if len(entries) != 2:
+        assert f"Child results returned: {len(entries)}/2" in text
 
 
 def test_batch_truncation_banner_marks_only_truncated_task():

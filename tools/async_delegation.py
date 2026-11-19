@@ -785,13 +785,6 @@ def _batch_crash(error: str, duration: float) -> dict[str, Any]:
     return {"results": [], "error": error, "total_duration_seconds": duration}
 
 
-def _batch_status(combined: dict[str, Any]) -> str:
-    """Batch status: completed unless every child errored/was interrupted."""
-    child_results = combined.get("results") or []
-    ok = ("completed", "success")
-    return "error" if child_results and all(r.get("status") not in ok for r in child_results) else "completed"
-
-
 def _dispatch(**kwargs) -> dict[str, Any]:
     from hermes_cli.backend_retirement import retirement
 
@@ -818,7 +811,7 @@ def _dispatch_admitted(
     splitting a call into per-group completions never consumes more capacity than the call did."""
     is_batch = goals is not None
     label = " batch" if is_batch else ""
-    classify = _batch_status if is_batch else (lambda r: r.get("status") or "completed")
+    expected_tasks = len(task_indexes) if task_indexes is not None else len(goals or [])
     crash_result = _batch_crash if is_batch else _single_crash
     dispatched_at = time.time()
     record: dict[str, Any] = {
@@ -855,7 +848,12 @@ def _dispatch_admitted(
                 rec.update(_started=True, _progress_ts=time.time())
         try:
             result = runner() or {}
-            status = classify(result)
+            if is_batch:
+                from tools.process_registry_notifications import delegation_batch_status
+                status = delegation_batch_status(result.get("results") or [], expected=expected_tasks,
+                                                 error=bool(result.get("error")))
+            else:
+                status = result.get("status") or "completed"
         except Exception as exc:
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
             result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
@@ -999,6 +997,8 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
     if is_batch:
         payload = {
             "is_batch": True, "results": result.get("results") or [],
+            "expected_task_count": len(record["task_indexes"]) if record.get("task_indexes") is not None
+            else len(record.get("goals") or []),
             "live_transcripts": result.get("live_transcripts"), "error": result.get("error"),
             "total_duration_seconds": result.get("total_duration_seconds"),
             **({"group": result["group"]} if result.get("group") is not None else {})}
