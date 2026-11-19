@@ -468,3 +468,60 @@ def test_benign_transcript_content_is_untouched():
     assert "src/parser.py" in body
     assert "def parse(x)" in body
     assert "refactor the parser" in body
+
+
+def test_manifest_completes_only_when_all_units_finish():
+    delegation_id, _writers, paths = create_live_transcripts([{"goal": "first"}, {"goal": "second"}])
+    manifest_path = Path(paths[0]).parent / "manifest.json"
+
+    update_manifest_statuses(delegation_id, [{"task_index": 0, "status": "completed", "schema_valid": False}])
+    partial = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert "completed" not in partial
+    assert [task["status"] for task in partial["tasks"]] == ["completed", "running"]
+    assert partial["tasks"][0]["schema_valid"] is False
+
+    update_manifest_statuses(delegation_id, [{"task_index": 1, "status": "failed", "exit_reason": "error"}])
+    done = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert done["completed"] and [task["status"] for task in done["tasks"]] == ["completed", "failed"]
+    assert done["tasks"][0]["schema_valid"] is False
+    assert done["tasks"][1]["exit_reason"] == "error"
+
+
+def test_concurrent_units_do_not_overwrite_manifest_statuses(monkeypatch):
+    import threading
+    from tools import delegation_live_log as log
+
+    delegation_id, _writers, paths = create_live_transcripts([{"goal": "first"}, {"goal": "second"}])
+    entered, first_can_finish, second_written = threading.Event(), threading.Event(), threading.Event()
+    dump = log._dump_json
+
+    def pause_first_write(path, manifest):
+        if threading.current_thread().name == "first-unit":
+            entered.set()
+            assert first_can_finish.wait(5)
+        dump(path, manifest)
+        if threading.current_thread().name == "second-unit":
+            second_written.set()
+
+    monkeypatch.setattr(log, "_dump_json", pause_first_write)
+    first, second = (
+        threading.Thread(
+            name=name, target=update_manifest_statuses,
+            args=(delegation_id, [{"task_index": index, "status": "completed"}]),
+        )
+        for index, name in enumerate(("first-unit", "second-unit"))
+    )
+    first.start()
+    try:
+        assert entered.wait(5)
+        second.start()
+        second_written.wait(0.7)  # With no lock, the second unit overwrites the same pre-update manifest.
+    finally:
+        first_can_finish.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+
+    assert not first.is_alive() and not second.is_alive()
+    manifest = json.loads((Path(paths[0]).parent / "manifest.json").read_text(encoding="utf-8"))
+    assert [task["status"] for task in manifest["tasks"]] == ["completed", "completed"]

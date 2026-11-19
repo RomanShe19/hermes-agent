@@ -284,23 +284,38 @@ def _write_manifest(delegation_id: str, task_list: list[dict[str, Any]],
                 "status": "running"} for i, t in enumerate(task_list)]})
 
 
+_MANIFEST_UPDATE_LOCK = threading.Lock()
+_TERMINAL_TASK_STATUSES = frozenset({
+    "completed", "success", "failed", "error", "interrupted", "timeout", "stalled",
+    "unknown", "cancelled", "canceled", "rejected",
+})
+
+
 def update_manifest_statuses(delegation_id: Optional[str],
                              results: list[dict[str, Any]],
                              home: Optional[Path] = None) -> None:
-    """Best-effort per-task status update once the batch has aggregated."""
+    """Merge one completed unit into the call-wide manifest."""
     if not delegation_id:
         return
-    with _best_effort("manifest update"):
+    # Units share a manifest and finish on different threads in the same backend.
+    with _best_effort("manifest update"), _MANIFEST_UPDATE_LOCK:
         mp = _manifest_path(delegation_id, home)
         manifest = json.loads(mp.read_text(encoding="utf-8-sig"))
         by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
-        for task in manifest.get("tasks", []):
-            r = by_index.get(task.get("index"))
-            if r is not None:
-                task["status"] = r.get("status", task.get("status"))
-                if r.get("exit_reason"):
-                    task["exit_reason"] = r["exit_reason"]
-        manifest["completed"] = time.strftime(_TIME_FMT)
+        tasks = manifest.get("tasks", [])
+        for task in tasks:
+            result = by_index.get(task.get("index"))
+            if result is None:
+                continue
+            task["status"] = result.get("status", task.get("status"))
+            if result.get("exit_reason"):
+                task["exit_reason"] = result["exit_reason"]
+            if isinstance(result.get("schema_valid"), bool):
+                task["schema_valid"] = result["schema_valid"]
+        if tasks and all(task.get("status") in _TERMINAL_TASK_STATUSES for task in tasks):
+            manifest.setdefault("completed", time.strftime(_TIME_FMT))
+        else:
+            manifest.pop("completed", None)
         _dump_json(mp, manifest)
 
 
