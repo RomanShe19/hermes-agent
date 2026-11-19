@@ -228,6 +228,14 @@ def _ac_set_queue(session: dict, entries: list) -> None:
         session.pop("queued_prompts", None)
 
 
+def _discard_queued_prompts(session: dict) -> None:
+    """Cancel queued work and any claimed head. Caller holds history_lock."""
+    _ac_set_queue(session, [])
+    generation = int(session.get("_queued_prompt_generation", 0)) + 1
+    session["_queued_prompt_generation"] = generation
+    session["_queued_prompt_discard_generation"] = generation
+
+
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     """Interrupt a busy turn on a worker thread, never under ``history_lock`` (some providers can't apply ``interrupt()``
     until a blocking call returns; inline it stalled ``session.resume``). At most one interrupt worker per session so
@@ -468,6 +476,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not admitted or session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
+        claimed_inflight = session.get("inflight_turn")
         _ac_set_queue(session, session.get("queued_prompts") or [])
         session["running"] = True
         queued_transport = queued.get("transport")
@@ -480,12 +489,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
-            # Generation bump cancelled the claim (Stop, compress re-anchor, …): don't dispatch, but restore the
-            # envelope (claimed head first, then whatever advanced into the slot) so a legitimate follow-up isn't dropped.
-            # See #84417.
-            advanced = session.get("queued_prompt")
-            _ac_set_queue(session, [queued, *([advanced] if advanced else []), *(session.get("queued_prompts") or [])])
-            session["running"] = False
+            # Stop and reset discard prompts. A compression re-anchor only invalidates dispatch;
+            # put the claimed head back in front of the remaining queue in that case.
+            if int(session.get("_queued_prompt_discard_generation", 0)) <= queue_generation:
+                advanced = session.get("queued_prompt")
+                _ac_set_queue(session, [queued, *([advanced] if advanced else []), *(session.get("queued_prompts") or [])])
+            if session.get("inflight_turn") is claimed_inflight:
+                session["running"] = False
             return True
     kwargs: dict = {"queued_prompt_generation": queue_generation}
     if queued.get("image_paths"):
