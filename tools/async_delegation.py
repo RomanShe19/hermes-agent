@@ -150,7 +150,7 @@ def _capture_routing_origin() -> dict[str, Any]:
         return {}
 
 
-def _persist_dispatch(record: dict[str, Any]) -> None:
+def _persist_dispatch(record: dict[str, Any]) -> bool:
     now = time.time()
     try:
         from gateway.status import get_process_start_time
@@ -159,13 +159,33 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts", "slot_key", *_ROUTING_KEYS)
         if key in record}
     try:  # where the children's terminals started; lets recovery add a git-state hint
         task_payload["owner_cwd"] = os.getcwd()
     except OSError:
         pass
     with _DB_LOCK, _transaction() as conn:
+        slot_limit = record.get("_max_async_children")
+        if slot_limit is not None:
+            # Both backends share this profile's ledger. Reserve in the same transaction as the capacity read.
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("""SELECT delegation_id, owner_pid, owner_started_at, task_json
+                FROM async_delegations WHERE state IN ('running','stalling','finalizing')""")
+            owner_live = _owner_liveness()
+            occupied = set()
+            checked: dict[tuple, bool] = {}
+            for delegation_id, pid, started, task_json in rows:
+                owner = (pid, started)
+                if owner not in checked:
+                    checked[owner] = owner_live is None or owner_live(pid, started)
+                if checked[owner]:
+                    slot_key = _json_object(task_json).get("slot_key")
+                    # Liveness already checks the start fingerprint with its platform tolerance.
+                    occupied.add((pid, slot_key if isinstance(slot_key, str) and slot_key else delegation_id))
+            slot = (os.getpid(), record["slot_key"])
+            if slot not in occupied and len(occupied) >= slot_limit:
+                return False
         conn.execute("""INSERT OR REPLACE INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
@@ -179,6 +199,7 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
         _prune_durable_records()
     except Exception:
         logger.warning("Could not prune old async delegation records", exc_info=True)
+    return True
 
 
 def _prune_durable_records() -> None:
@@ -804,8 +825,8 @@ def _dispatch_admitted(
     task_transcripts: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
-    record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
-    and exceed the cap. At capacity the dispatch is REJECTED (never queued) so a runaway model
+    record insert share a lock within a process and a SQLite transaction across backends of the
+    same profile. At capacity the dispatch is REJECTED (never queued) so a runaway model
     can't pile up unbounded background work. ``slot_key`` names the pool slot the unit occupies
     (default: its own id); the units of one delegate_task call share the first unit's id so
     splitting a call into per-group completions never consumes more capacity than the call did."""
@@ -823,6 +844,7 @@ def _dispatch_admitted(
         "status": "running", "dispatched_at": dispatched_at, "completed_at": None,
         "interrupt_fn": interrupt_fn, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
         "slot_key": slot_key or delegation_id,
+        "_max_async_children": max_async_children,
         **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
         # Which of the call's ``goals`` this unit runs (None = all of them).
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
@@ -864,7 +886,10 @@ def _dispatch_admitted(
 
     persisted = reservation = False
     try:
-        _persist_dispatch(record)
+        if _persist_dispatch(record) is False:
+            with _records_lock:
+                _records.pop(delegation_id, None)
+            return {"status": "rejected", "reason": "at_capacity", "error": capacity_error}
         persisted = True
         # Grouped units share a slot. Size the executor for units so a sibling does not wait
         # for the prior unit to finish before it can start.

@@ -390,3 +390,65 @@ def test_throttle_runs_at_most_one_sweep_per_home_per_interval(tmp_path, monkeyp
             ad.maybe_sweep_orphaned_completions(q, now=101.0)
         ad.maybe_sweep_orphaned_completions(q, now=100.0 + ad.ORPHAN_SWEEP_INTERVAL_S + 1)
     assert calls == [str(tmp_path / "a"), str(tmp_path / "b"), str(tmp_path / "a")]
+
+
+_SLOT_OWNER = r"""
+import json, os, sys, threading
+from pathlib import Path
+from tools import async_delegation as ad
+
+gate = threading.Event()
+receipt = ad.dispatch_async_delegation(
+    goal="occupy a shared slot", context=None, toolsets=None, role="leaf", model="test-model",
+    session_key="other-backend", runner=lambda: gate.wait(30), max_async_children=1,
+)
+receipt_path = Path(sys.argv[1])
+ready = receipt_path.with_suffix(".tmp")
+ready.write_text(json.dumps(receipt), encoding="utf-8")
+ready.replace(receipt_path)
+sys.stdin.readline()
+os._exit(0)  # Leave the running record behind, as a backend crash would.
+"""
+
+
+def test_background_capacity_is_shared_and_ignores_dead_owners(tmp_path):
+    import json
+
+    home = tmp_path / "home"
+    home.mkdir()
+    receipt_file = tmp_path / "owner-receipt"
+    owner = subprocess.Popen(
+        [sys.executable, "-c", _SLOT_OWNER, str(receipt_file)], cwd=REPO,
+        env={**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": REPO},
+        stdin=subprocess.PIPE, text=True,
+    )
+    runner_called = threading.Event()
+
+    def try_dispatch():
+        return ad.dispatch_async_delegation(
+            goal="do the next task", context=None, toolsets=None, role="leaf", model="test-model",
+            session_key="this-backend", max_async_children=1,
+            runner=lambda: runner_called.set() or {"status": "completed", "summary": "finished"},
+        )
+
+    try:
+        deadline = time.monotonic() + 15
+        while not receipt_file.exists() and owner.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert receipt_file.exists(), "the sibling backend never acquired a slot"
+        receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
+        assert receipt["status"] == "dispatched"
+        with _Home(home):
+            refused = try_dispatch()
+        assert refused["status"] == "rejected"
+        assert refused["reason"] == "at_capacity"
+        assert not runner_called.is_set()
+    finally:
+        owner.communicate("\n", timeout=15)
+    assert owner.returncode == 0
+    assert _row(home, receipt["delegation_id"])["state"] == "running"
+
+    with _Home(home):
+        accepted = try_dispatch()
+        assert accepted["status"] == "dispatched"
+        assert runner_called.wait(5)
